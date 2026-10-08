@@ -1,5 +1,6 @@
 """Tablely: share one machine's GPUs and CPU cores among training jobs by priority."""
 
+from .ledger import Ledger, MemoryLedger
 from .planner import Allocation, Plan, Policy, plan, share_cpus
 from .resources import Inventory, build_inventory, detect_cpus, detect_gpus
 from .runner import JobState, Runner
@@ -13,6 +14,8 @@ __all__ = [
     "Inventory",
     "JobSpec",
     "JobState",
+    "Ledger",
+    "MemoryLedger",
     "Plan",
     "Policy",
     "Runner",

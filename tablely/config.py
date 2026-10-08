@@ -6,7 +6,7 @@ import json
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Mapping, Union
+from typing import Any, List, Mapping, Optional, Union
 
 from .planner import Policy
 from .resources import CpuSetting, GpuSetting, Inventory, build_inventory
@@ -17,9 +17,9 @@ if sys.version_info >= (3, 11):
 else:  # pragma: no cover
     import tomli as tomllib
 
-_TOP_KEYS = {"resources", "jobs", "log_dir", "backfill"}
+_TOP_KEYS = {"resources", "jobs", "log_dir", "backfill", "task"}
 _RESOURCE_KEYS = {"cpus", "gpus", "reserve_cpus"}
-_JOB_KEYS = {"name", "command", "priority", "device", "gpus", "cpus", "max_cpus", "env", "cwd", "shell"}
+_JOB_KEYS = {"name", "command", "priority", "device", "gpus", "cpus", "max_cpus", "env", "cwd", "shell", "task"}
 
 
 class ConfigError(ValueError):
@@ -34,6 +34,7 @@ class Config:
     cpus: CpuSetting = None
     gpus: GpuSetting = None
     reserve_cpus: int = 0
+    task: Optional[str] = None  # what this batch is for; jobs without their own task inherit it
 
     def inventory(self, simulate: bool = False) -> Inventory:
         try:
@@ -86,6 +87,10 @@ def parse_config(data: Any, base_dir: Union[str, Path] = ".") -> Config:
     if not isinstance(backfill, bool):
         raise ConfigError("backfill must be true or false")
 
+    task = data.get("task")
+    if task is not None and not isinstance(task, str):
+        raise ConfigError("task must be a string")
+
     log_dir = Path(str(data.get("log_dir", "tablely-logs")))
     reserve = resources.get("reserve_cpus", 0)
     if isinstance(reserve, bool) or not isinstance(reserve, int):
@@ -97,6 +102,7 @@ def parse_config(data: Any, base_dir: Union[str, Path] = ".") -> Config:
         cpus=resources.get("cpus"),
         gpus=resources.get("gpus"),
         reserve_cpus=reserve,
+        task=task,
     )
 
 

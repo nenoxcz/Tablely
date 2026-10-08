@@ -5,6 +5,7 @@
 
 log_dir = "logs"       # one <job>.log per job, relative to this file
 backfill = false       # true = lower-priority jobs may use resources a waiting job is queued for
+task = "example batch" # what this run is for; other agents see it in `tablely status`
 
 [resources]
 # cpus = "0-15"        # default: every core this process may use
@@ -18,6 +19,7 @@ priority = 10          # most important: gets a GPU first
 device = "gpu"         # GPU only: waits if none is free
 gpus = 1
 cpus = 4               # cores for data loading; GPU jobs stay at this unless max_cpus is set
+task = "finetune on the new data mix"   # per-job purpose (default: the task above)
 
 [[jobs]]
 name = "vision-cnn"

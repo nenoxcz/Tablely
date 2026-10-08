@@ -156,8 +156,8 @@ def test_stop_all_terminates_the_whole_process_group(tmp_path):
         JobSpec(name="queued", command=py("pass"), device="gpu"),
     ]
     runner = make_runner(tmp_path, jobs, gpus=("0",), cpus=CPUS[:1])
-    runner.log_dir.mkdir()
-    runner._schedule()
+    runner._register()
+    runner._tick()
     deadline = time.time() + 5
     while not pid_file.exists() and time.time() < deadline:
         time.sleep(0.02)

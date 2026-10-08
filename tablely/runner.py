@@ -5,6 +5,7 @@ from __future__ import annotations
 import enum
 import os
 import re
+import secrets
 import shlex
 import signal
 import subprocess
@@ -12,9 +13,21 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, TextIO, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, TextIO, Union
 
 from . import _fmt, affinity
+from .ledger import (
+    PENDING,
+    RUNNING,
+    Board,
+    Ledger,
+    MemoryLedger,
+    allocation_to_json,
+    default_agent,
+    hostname,
+    make_event,
+    process_identity,
+)
 from .planner import Allocation, Policy, check_feasible, plan
 from .resources import Inventory, format_cpu_list
 from .spec import JobSpec, format_priority
@@ -77,11 +90,17 @@ def render_command(spec: JobSpec, alloc: Allocation) -> Union[str, List[str]]:
     return [fill(part) for part in spec.command]
 
 
-def build_env(base: Mapping[str, str], spec: JobSpec, alloc: Allocation) -> Dict[str, str]:
+def build_env(
+    base: Mapping[str, str],
+    spec: JobSpec,
+    alloc: Allocation,
+    extra: Optional[Mapping[str, str]] = None,
+) -> Dict[str, str]:
     """Environment for a job: its own ``env`` plus the resources it was given.
 
     GPU visibility is always enforced. Thread-count variables follow the core
-    count unless the job sets them itself.
+    count unless the job sets them itself. ``extra`` adds Tablely's own
+    bookkeeping variables (agent, run, ledger location).
     """
     env = dict(base)
     env.update(spec.env)
@@ -101,11 +120,42 @@ def build_env(base: Mapping[str, str], spec: JobSpec, alloc: Allocation) -> Dict
             "TABLELY_CPU_LIST": values["cpu_list"],
         }
     )
+    if extra:
+        env.update(extra)
     return env
 
 
+def git_info(cwd: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Commit, branch and dirty flag of the repository a job runs in, if any."""
+
+    def git(*args: str) -> str:
+        result = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            raise OSError(result.stderr)
+        return result.stdout.strip()
+
+    try:
+        commit = git("rev-parse", "--short", "HEAD")
+        branch = git("branch", "--show-current") or None
+        dirty = bool(git("status", "--porcelain", "--untracked-files=no"))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {"commit": commit, "branch": branch, "dirty": dirty}
+
+
+def command_text(spec: JobSpec) -> str:
+    return spec.command if isinstance(spec.command, str) else shlex.join(spec.command)
+
+
 class Runner:
-    """Runs a batch of jobs to completion, re-planning whenever one finishes."""
+    """Runs a batch of jobs to completion.
+
+    Every scheduling round goes through a ledger. With the shared
+    :class:`~tablely.ledger.Ledger` (what ``tablely run`` uses), all Tablely
+    processes on the machine plan GPUs and cores together and every start,
+    finish and resize is recorded with the agent and task behind it. The
+    default in-memory ledger keeps the run to itself.
+    """
 
     def __init__(
         self,
@@ -118,6 +168,9 @@ class Runner:
         stop_timeout: float = 10.0,
         out: Optional[TextIO] = None,
         base_env: Optional[Mapping[str, str]] = None,
+        ledger: Union[Ledger, MemoryLedger, None] = None,
+        agent: Optional[str] = None,
+        task: Optional[str] = None,
     ) -> None:
         errors, self.warnings = check_feasible(inventory, jobs)
         if errors:
@@ -129,32 +182,48 @@ class Runner:
         self.stop_timeout = stop_timeout
         self.out = out if out is not None else sys.stdout
         self.base_env = dict(os.environ if base_env is None else base_env)
+        self.ledger = ledger if ledger is not None else MemoryLedger()
+        self.agent = agent or default_agent()
+        self.task = task
+        self.run_id = secrets.token_hex(4)
         self.specs: Dict[str, JobSpec] = {spec.name: spec for spec in jobs}
         self.records: Dict[str, JobRecord] = {spec.name: JobRecord(spec) for spec in jobs}
+        self._keys = {name: f"{self.run_id}.{name}" for name in self.specs}
+        self._names = {key: name for name, key in self._keys.items()}
+        self._run_info: Dict[str, Any] = {}
+        self._shadow: Dict[str, Dict[str, Any]] = {}  # our last view of each job entry
+        self._outbox: List[Dict[str, Any]] = []
+        self._git: Dict[Optional[str], Optional[Dict[str, Any]]] = {}
         self._name_width = max((len(name) for name in self.specs), default=4)
 
     # -- public ---------------------------------------------------------------
 
     def run(self) -> int:
         """Run every job. Returns 0 if all succeeded, 1 if any failed, 130 if interrupted."""
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        for spec in self.specs.values():
+            if spec.cwd not in self._git:
+                self._git[spec.cwd] = git_info(spec.cwd)
+        self._register()
+        self._say(f"agent: {self.agent}, run {self.run_id}" + (f", task: {self.task}" if self.task else ""))
         self._say(f"resources: {self.inventory.describe()}")
         self._say(f"policy: {'backfill' if self.policy.backfill else 'strict priority'}, logs in {self.log_dir}")
+        if self.ledger.shared:
+            self._say(f"shared with other agents via {self.ledger.home} (see: tablely status)")
         for warning in self.warnings:
             self._say(f"warning: {warning}")
         interrupted = False
         try:
-            self._schedule()
-            while self._in_state(JobState.RUNNING):
-                if self._reap():
-                    self._schedule()
-                else:
-                    time.sleep(self.poll_interval)
+            while True:
+                self._tick()
+                if not self._in_state(JobState.RUNNING) and not self._in_state(JobState.PENDING):
+                    break
+                time.sleep(self.poll_interval)
         except KeyboardInterrupt:
             interrupted = True
             self._say("interrupted: stopping running jobs")
         finally:
             self._stop_all()
+            self._unregister()
             self._say("")
             self._say(self.summary())
         if interrupted:
@@ -180,44 +249,178 @@ class Runner:
             )
         return "summary:\n" + _fmt.table(["JOB", "PRIO", "RAN ON", "RESULT", "TIME"], rows)
 
+    # -- ledger bookkeeping ---------------------------------------------------
+
+    def _register(self) -> None:
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        with self.ledger.locked() as board:
+            board.prune()
+            inventory, policy, shared = board.claim_pool(self.inventory, self.policy, self.run_id)
+            if shared and (inventory != self.inventory or policy != self.policy):
+                errors, warnings = check_feasible(inventory, list(self.specs.values()))
+                if errors:
+                    raise ValueError(
+                        "other agents are running Tablely on this machine and share a different pool "
+                        f"({inventory.describe()}):\n" + "\n".join(errors)
+                    )
+                mode = "backfill" if policy.backfill else "strict priority"
+                self.warnings = warnings + [f"other agents already set this machine's pool; using it ({mode})"]
+            self.inventory, self.policy = inventory, policy
+            self._run_info = {
+                "agent": self.agent,
+                "task": self.task,
+                "pid": os.getpid(),
+                "pid_identity": process_identity(os.getpid()),
+                "host": hostname(),
+                "cwd": os.getcwd(),
+                "started_at": now,
+                "jobs": list(self.specs),
+            }
+            board.add_run(self.run_id, dict(self._run_info))
+            for name in self.specs:
+                self._put(board, name, self._new_entry(name, board.next_seq(), now))
+            self._outbox.append(
+                make_event(now, "run-start", self.agent, self.run_id, None, self.task,
+                           f"{len(self.specs)} job(s): {', '.join(self.specs)}")
+            )
+            self._flush(board)
+
+    def _unregister(self) -> None:
+        with self.ledger.locked() as board:
+            for key in self._keys.values():
+                board.drop_job(key)
+            board.remove_run(self.run_id)
+            states = [r.state for r in self.records.values()]
+            detail = ", ".join(
+                f"{states.count(s)} {s.value}" for s in (JobState.SUCCEEDED, JobState.FAILED, JobState.CANCELLED)
+                if states.count(s)
+            )
+            self._outbox.append(make_event(time.time(), "run-end", self.agent, self.run_id, None, self.task, detail))
+            self._flush(board)
+
+    def _new_entry(self, name: str, seq: int, now: float) -> Dict[str, Any]:
+        spec = self.specs[name]
+        return {
+            "run": self.run_id,
+            "agent": self.agent,
+            "name": name,
+            "task": spec.task or self.task,
+            "priority": spec.priority,
+            "device": spec.device.value,
+            "gpus": spec.gpus,
+            "cpus": spec.cpus,
+            "max_cpus": spec.max_cpus,
+            "command": command_text(spec),
+            "git": self._git.get(spec.cwd),
+            "state": PENDING,
+            "seq": seq,
+            "submitted_at": now,
+            "wait_reason": None,
+            "allocation": None,
+            "pid": None,
+            "pid_identity": None,
+            "started_at": None,
+            "log": None,
+            "progress": None,
+            "progress_at": None,
+            "orphan": False,
+        }
+
+    def _put(self, board: Board, name: str, entry: Dict[str, Any]) -> None:
+        board.put_job(self._keys[name], entry)
+        self._shadow[name] = entry
+
+    def _sync(self, board: Board) -> None:
+        """Re-add our run and unfinished jobs if the board lost them (e.g. state file removed)."""
+        if self.run_id not in board.runs:
+            board.add_run(self.run_id, dict(self._run_info))
+        for name, rec in self.records.items():
+            key = self._keys[name]
+            if rec.state in (JobState.PENDING, JobState.RUNNING):
+                entry = board.job(key)
+                if entry is None:
+                    self._put(board, name, dict(self._shadow[name], seq=board.next_seq()))
+                else:
+                    self._shadow[name] = entry
+
+    def _flush(self, board: Board) -> None:
+        for event in self._outbox:
+            board.log(event)
+        self._outbox.clear()
+
     # -- scheduling -----------------------------------------------------------
 
-    def _schedule(self) -> None:
-        while True:
-            running = {n: r.allocation for n, r in self.records.items() if r.state is JobState.RUNNING}
-            pending = [n for n, r in self.records.items() if r.state is JobState.PENDING]
-            decision = plan(self.inventory, self.specs, running, pending, self.policy)
+    def _tick(self) -> None:
+        with self.ledger.locked() as board:
+            board.prune()
+            self._sync(board)
+            self._reap(board)
+            self._schedule(board)
+            self._flush(board)
 
-            # Shrink/grow running jobs before starting new ones on the freed cores.
-            for name, alloc in decision.allocations.items():
-                rec = self.records[name]
-                if rec.state is JobState.RUNNING and alloc.cpus != rec.allocation.cpus:
-                    self._resize(rec, alloc.cpus)
+    def _schedule(self, board: Board) -> None:
+        while True:
+            specs, running, pending = board.planning_view()
+            decision = plan(self.inventory, specs, running, pending, self.policy)
+
+            for key, alloc in decision.allocations.items():
+                entry = board.job(key)
+                if entry["state"] == RUNNING and list(alloc.cpus) != entry["allocation"]["cpus"]:
+                    entry["allocation"]["cpus"] = list(alloc.cpus)
+                    if key not in self._names:
+                        # Another agent's job: move it now so a job we start here never
+                        # shares cores with it; its own runner confirms on its next tick.
+                        affinity.pin_group(entry["pid"], alloc.cpus)
+            for key, reason in decision.waiting.items():
+                board.job(key)["wait_reason"] = reason
 
             launch_failed = False
-            for name in decision.started:
-                if not self._launch(self.records[name], decision.allocations[name]):
+            for key in decision.started:
+                name = self._names.get(key)
+                if name is None:
+                    board.job(key)["wait_reason"] = "starting"  # its own runner launches it
+                elif not self._launch(self.records[name], decision.allocations[key], board):
                     launch_failed = True
-
-            for name, reason in decision.waiting.items():
-                rec = self.records[name]
-                if rec.state is JobState.PENDING and reason != rec.wait_reason:
-                    rec.wait_reason = reason
-                    self._event("wait", rec, reason)
-
             if not launch_failed:
-                return  # otherwise re-plan: the failed job's resources are free again
+                break  # otherwise re-plan: the failed job's resources are free again
 
-    def _launch(self, rec: JobRecord, alloc: Allocation) -> bool:
+        self._reconcile(board)
+        for name, rec in self.records.items():
+            if rec.state is not JobState.PENDING:
+                continue
+            reason = board.job(self._keys[name])["wait_reason"]
+            if reason and reason != rec.wait_reason:
+                rec.wait_reason = reason
+                self._event("wait", rec, reason)
+
+    def _reconcile(self, board: Board) -> None:
+        """Apply core changes the board holds for our running jobs (whoever planned them)."""
+        for name, rec in self.records.items():
+            if rec.state is not JobState.RUNNING:
+                continue
+            entry = board.job(self._keys[name])
+            cpus = tuple(entry["allocation"]["cpus"])
+            if cpus != rec.allocation.cpus:
+                self._resize(rec, cpus)
+
+    def _launch(self, rec: JobRecord, alloc: Allocation, board: Board) -> bool:
         spec = rec.spec
+        key = self._keys[spec.name]
         rec.log_path = self.log_dir / f"{spec.name}.log"
+        extra = {"TABLELY_AGENT": self.agent, "TABLELY_RUN": self.run_id, "TABLELY_JOB_KEY": key}
+        task = spec.task or self.task
+        if task:
+            extra["TABLELY_TASK"] = task
+        if self.ledger.home is not None:
+            extra["TABLELY_HOME"] = str(self.ledger.home)
         try:
             with open(rec.log_path, "wb") as log:
                 rec.process = subprocess.Popen(
                     render_command(spec, alloc),
                     shell=spec.shell,
                     cwd=spec.cwd,
-                    env=build_env(self.base_env, spec, alloc),
+                    env=build_env(self.base_env, spec, alloc, extra),
                     stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
@@ -228,16 +431,32 @@ class Runner:
             rec.state = JobState.FAILED
             rec.error = f"launch failed: {exc}"
             rec.started_at = rec.ended_at = time.time()
+            board.drop_job(key)
             self._event("fail", rec, rec.error)
             return False
         rec.state = JobState.RUNNING
         rec.allocation = alloc
         rec.started_at = time.time()
         rec.wait_reason = None
+        entry = board.job(key)
+        entry.update(
+            state=RUNNING,
+            allocation=allocation_to_json(alloc),
+            pid=rec.process.pid,
+            pid_identity=process_identity(rec.process.pid),
+            started_at=rec.started_at,
+            wait_reason=None,
+            log=str(rec.log_path.resolve()),
+        )
+        self._shadow[spec.name] = entry
         self._event(
             "start",
             rec,
             f"prio {format_priority(spec.priority)}  {_fmt.placement(alloc)}  cores {_fmt.cores(alloc)}",
+            device=alloc.device,
+            gpus=list(alloc.gpus),
+            cpus=list(alloc.cpus),
+            git=entry.get("git"),
         )
         return True
 
@@ -245,24 +464,22 @@ class Runner:
         old = rec.allocation
         rec.allocation = Allocation(device=old.device, gpus=old.gpus, cpus=tuple(cpus))
         affinity.pin_group(rec.process.pid, cpus)
-        self._event("resize", rec, f"cores {_fmt.cores(old)} -> {_fmt.cores(rec.allocation)}")
+        self._event("resize", rec, f"cores {_fmt.cores(old)} -> {_fmt.cores(rec.allocation)}", cpus=list(cpus))
 
-    def _reap(self) -> bool:
-        finished = False
-        for rec in self.records.values():
-            if rec.state is not JobState.RUNNING:
-                continue
-            if not _has_exited(rec.process):
+    def _reap(self, board: Board) -> None:
+        for name, rec in self.records.items():
+            if rec.state is not JobState.RUNNING or not _has_exited(rec.process):
                 continue
             code = self._finish(rec)
             rec.state = JobState.SUCCEEDED if code == 0 else JobState.FAILED
+            board.drop_job(self._keys[name])
             took = _fmt.duration(rec.ended_at - rec.started_at)
+            seconds = round(rec.ended_at - rec.started_at, 1)
             if code == 0:
-                self._event("done", rec, f"ok in {took}")
+                self._event("done", rec, f"ok in {took}", returncode=code, seconds=seconds)
             else:
-                self._event("fail", rec, f"exit {code} after {took}, see {rec.log_path}")
-            finished = True
-        return finished
+                self._event("fail", rec, f"exit {code} after {took}, see {rec.log_path}",
+                            returncode=code, seconds=seconds)
 
     def _stop_all(self) -> None:
         running = self._in_state(JobState.RUNNING)
@@ -310,8 +527,13 @@ class Runner:
     def _in_state(self, state: JobState) -> List[JobRecord]:
         return [r for r in self.records.values() if r.state is state]
 
-    def _event(self, kind: str, rec: JobRecord, detail: str) -> None:
+    def _event(self, kind: str, rec: JobRecord, detail: str, **extra: Any) -> None:
+        """Print an event and queue it for the shared history."""
         self._say(f"{kind:<6} {rec.spec.name:<{self._name_width}}  {detail}", stamp=True)
+        self._outbox.append(
+            make_event(time.time(), kind, self.agent, self.run_id, rec.spec.name,
+                       rec.spec.task or self.task, detail, **extra)
+        )
 
     def _say(self, text: str, stamp: bool = False) -> None:
         if stamp:

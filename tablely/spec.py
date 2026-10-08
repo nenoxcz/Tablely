@@ -38,6 +38,7 @@ class JobSpec:
     env: Mapping[str, str] = field(default_factory=dict)
     cwd: Optional[str] = None
     shell: bool = False
+    task: Optional[str] = None  # what this job is for, shown to other agents
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.match(self.name):
@@ -79,6 +80,8 @@ class JobSpec:
         elif self.gpus < 1:
             raise ValueError(f"{self.name}: gpus must be at least 1 for device {self.device.value!r}")
         object.__setattr__(self, "env", {str(k): str(v) for k, v in dict(self.env).items()})
+        if self.task is not None and not isinstance(self.task, str):
+            raise ValueError(f"{self.name}: task must be a string")
 
     def cpu_cap(self, on_gpu: bool) -> Optional[int]:
         """Upper bound on cores for this job given where it was placed (None = no cap)."""
