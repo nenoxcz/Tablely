@@ -3,10 +3,15 @@
 
 Claude Code hooks (see .claude/settings.json) run ``agent_log.py hook`` when a
 session starts, on every prompt, after every file edit, when the agent stops
-and when the session ends. Each session keeps one small JSON file in
-``.agents/sessions/`` — one file per session, so parallel agents never write
-the same file and branches merge cleanly. Committed with the work, it tells
-other agents (and people) on other machines what this session was doing.
+and when the session ends. Each session keeps one small JSON entry:
+
+* live, in ``.git/agent-sessions/`` (the git common dir, so every worktree of
+  the clone sees it) — updated on every event, never committed;
+* committed, in ``.agents/sessions/`` — one file per session, so parallel
+  agents never write the same file. It is only rewritten when the agent edits
+  files (or runs ``task``), i.e. when there is work to commit anyway, so the
+  log never leaves the tree dirty on its own. Pushed with the work, it tells
+  agents on other machines what this session was doing.
 
     python3 tools/agent_log.py board              # who works on what, across all branches
     python3 tools/agent_log.py board --fetch      # ... after fetching the remote first
@@ -119,12 +124,25 @@ def load(path: Path) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 
-def save(root: Path, entry: Dict[str, Any]) -> None:
+def load_entry(root: Path, session: str) -> Optional[Dict[str, Any]]:
+    """The newest of the committed and the live copy of a session's entry."""
+    copies = [load(session_file(root, session))]
+    mirror = shared_dir(root)
+    if mirror is not None:
+        copies.append(load(mirror / f"{session[:8]}.json"))
+    copies = [c for c in copies if c]
+    return max(copies, key=lambda c: c.get("updated_at") or "") if copies else None
+
+
+def save(root: Path, entry: Dict[str, Any], commit_copy: bool) -> None:
+    """Write the live copy, and the committed copy too when ``commit_copy`` (or outside git)."""
     text = json.dumps(entry, indent=2, ensure_ascii=False) + "\n"
-    targets = [session_file(root, entry["session"])]
+    targets = []
     mirror = shared_dir(root)
     if mirror is not None:
         targets.append(mirror / f"{entry['session'][:8]}.json")
+    if commit_copy or mirror is None:
+        targets.append(session_file(root, entry["session"]))
     for path in targets:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -168,7 +186,7 @@ def handle_hook(payload: Dict[str, Any]) -> None:
     if not session or not event:
         return
     root = repo_root(os.environ.get("CLAUDE_PROJECT_DIR") or payload.get("cwd") or os.getcwd())
-    entry = load(session_file(root, session)) or new_entry(session)
+    entry = load_entry(root, session) or new_entry(session)
 
     if event == "SessionStart":
         entry["status"] = "idle"
@@ -197,7 +215,8 @@ def handle_hook(payload: Dict[str, Any]) -> None:
 
     entry["branch"] = git(root, "rev-parse", "--abbrev-ref", "HEAD") or entry.get("branch")
     entry["updated_at"] = now_iso()
-    save(root, entry)
+    # Only an edit touches the committed copy: the tree is being changed anyway.
+    save(root, entry, commit_copy=event == "PostToolUse")
 
     if event == "SessionStart":
         # SessionStart output becomes context for the new session: tell it who else is busy.
@@ -296,13 +315,13 @@ def cmd_task(args: argparse.Namespace) -> int:
     if not session:
         mine = [s for s in collect(root) if s.get("seen_in") == "here" and s.get("status") != "ended"]
         session = mine[0]["session"] if mine else str(uuid.uuid4())
-    entry = load(session_file(root, session)) or new_entry(session)
+    entry = load_entry(root, session) or new_entry(session)
     entry["task"], entry["task_source"] = " ".join(args.text), "agent"
     if entry.get("status") != "ended":
         entry["status"] = "working"
     entry["branch"] = git(root, "rev-parse", "--abbrev-ref", "HEAD") or entry.get("branch")
     entry["updated_at"] = now_iso()
-    save(root, entry)
+    save(root, entry, commit_copy=True)
     print(f"{session[:8]}: {entry['task']}")
     return 0
 
