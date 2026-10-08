@@ -7,4 +7,7 @@ def isolated_tablely_home(tmp_path, monkeypatch):
     home = tmp_path / "tablely-home"
     monkeypatch.setenv("TABLELY_HOME", str(home))
     monkeypatch.delenv("TABLELY_AGENT", raising=False)
+    # nor from the Claude Code session that may be running them
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.delenv("AGENT_LOG_PROMPTS", raising=False)
     return home

@@ -3,10 +3,20 @@
   "agent": "claude",
   "branch": "nenoxcz/kind-maxwell-onq8cl",
   "status": "working",
-  "task": "Multi-agent coordination: shared ledger, tablely status/history/note, dev work log hooks",
+  "task": "Make Tablely act as the handoff: brief for next agent, handoff notes, last results",
   "task_source": "agent",
   "started_at": "2026-10-08T05:38:03Z",
-  "updated_at": "2026-10-08T05:38:03Z",
-  "prompts": [],
-  "files": []
+  "updated_at": "2026-10-08T07:11:11Z",
+  "prompts": [
+    {
+      "at": "2026-10-08T07:05:34Z",
+      "text": "그러니까 테이블리가 핸즈오프를 대신하는 느낌인거임."
+    }
+  ],
+  "files": [],
+  "handoff": {
+    "at": "2026-10-08T07:11:11Z",
+    "text": "끝낸 것: tablely brief(실행중/결과/메모 요약), 작업 종료 이벤트에 마지막 진행상황·커밋 기록, agent_log handoff/brief 명령, 응답 끝날 때 마지막 답변 자동 저장. 다음: 선점(체크포인트 후 재개), 데몬/tablely submit, 실제 GPU 서버 검증. 주의: Stop hook은 커밋 대상 파일을 건드리면 안 됨(종료 검사와 무한 루프).",
+    "head": "004c401"
+  }
 }

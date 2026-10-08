@@ -1,4 +1,4 @@
-"""Command line: ``tablely resources | plan | run | status | history | note``."""
+"""Command line: ``tablely resources | plan | run | status | history | note | brief``."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import time
 from typing import List, Optional, Sequence, Union
 
 from . import __version__, _fmt
-from .board_view import render_history, render_status
+from .board_view import render_brief, render_history, render_status
 from .config import Config, ConfigError, load_config
 from .ledger import Board, Ledger, default_agent, make_event
 from .planner import Policy, check_feasible, plan
@@ -78,7 +78,17 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="print events as JSON lines")
     p.set_defaults(func=_cmd_history)
 
-    p = sub.add_parser("note", parents=[shared], help="record what an agent is working on right now")
+    p = sub.add_parser(
+        "brief",
+        parents=[shared],
+        help="handoff for the next agent: what runs now, what finished, what agents noted",
+    )
+    p.add_argument("--hours", type=float, default=24.0, help="how far back to look (default 24)")
+    p.add_argument("--agent", help="only this agent's work")
+    p.add_argument("--json", action="store_true", help="print the board and the events as JSON")
+    p.set_defaults(func=_cmd_brief)
+
+    p = sub.add_parser("note", parents=[shared], help="record what an agent is working on or what comes next")
     p.add_argument("text", nargs="+")
     p.add_argument("--agent", help="who (default: $TABLELY_AGENT or the login name)")
     p.set_defaults(func=_cmd_note)
@@ -197,6 +207,18 @@ def _cmd_history(args: argparse.Namespace) -> int:
             print(json.dumps(event, ensure_ascii=False))
     else:
         print(render_history(events))
+    return 0
+
+
+def _cmd_brief(args: argparse.Namespace) -> int:
+    ledger = Ledger(args.home)
+    data = ledger.snapshot()
+    since = time.time() - args.hours * 3600
+    events = [e for e in ledger.history(agent=args.agent) if e.get("t", 0) >= since]
+    if args.json:
+        print(json.dumps({"board": data, "events": events}, indent=2, ensure_ascii=False))
+    else:
+        print(render_brief(data, events, hours=args.hours, agent=args.agent))
     return 0
 
 

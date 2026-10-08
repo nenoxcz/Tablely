@@ -472,14 +472,14 @@ class Runner:
                 continue
             code = self._finish(rec)
             rec.state = JobState.SUCCEEDED if code == 0 else JobState.FAILED
+            self._shadow[name] = board.job(self._keys[name]) or self._shadow[name]
             board.drop_job(self._keys[name])
             took = _fmt.duration(rec.ended_at - rec.started_at)
-            seconds = round(rec.ended_at - rec.started_at, 1)
+            outcome = self._outcome(name, returncode=code, seconds=round(rec.ended_at - rec.started_at, 1))
             if code == 0:
-                self._event("done", rec, f"ok in {took}", returncode=code, seconds=seconds)
+                self._event("done", rec, f"ok in {took}", **outcome)
             else:
-                self._event("fail", rec, f"exit {code} after {took}, see {rec.log_path}",
-                            returncode=code, seconds=seconds)
+                self._event("fail", rec, f"exit {code} after {took}, see {rec.log_path}", **outcome)
 
     def _stop_all(self) -> None:
         running = self._in_state(JobState.RUNNING)
@@ -491,7 +491,7 @@ class Runner:
                 if _has_exited(rec.process) or time.time() >= deadline:
                     self._finish(rec)
                     rec.state = JobState.CANCELLED
-                    self._event("stop", rec, "cancelled")
+                    self._event("stop", rec, "cancelled", **self._outcome(rec.spec.name))
                     running.remove(rec)
             if running:
                 time.sleep(min(self.poll_interval, 0.1))
@@ -499,6 +499,11 @@ class Runner:
             rec.state = JobState.CANCELLED
 
     # -- helpers --------------------------------------------------------------
+
+    def _outcome(self, name: str, **extra: Any) -> Dict[str, Any]:
+        """What the next agent needs about a finished job: last progress, code version, log."""
+        entry = self._shadow.get(name) or {}
+        return dict(extra, progress=entry.get("progress"), git=entry.get("git"), log=entry.get("log"))
 
     def _finish(self, rec: JobRecord) -> int:
         """Kill whatever is left of the job's process group, then reap the leader.

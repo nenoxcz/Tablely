@@ -13,14 +13,22 @@ and when the session ends. Each session keeps one small JSON entry:
   log never leaves the tree dirty on its own. Pushed with the work, it tells
   agents on other machines what this session was doing.
 
+This replaces hand-written handoff notes: a new session is told, before its
+first prompt, what the latest sessions were doing, where they left off and who
+is busy right now.
+
+    python3 tools/agent_log.py brief              # the handoff a new session gets
     python3 tools/agent_log.py board              # who works on what, across all branches
     python3 tools/agent_log.py board --fetch      # ... after fetching the remote first
     python3 tools/agent_log.py task "add daemon"  # state this session's task in your own words
+    python3 tools/agent_log.py handoff "done X; next Y; careful with Z"   # before finishing
 
 The task is whatever the agent last declared with ``task``; until it does, the
-first line of the latest prompt stands in. The repository may be public, so
-set ``AGENT_LOG_PROMPTS=0`` (e.g. under "env" in .claude/settings.json) to keep
-prompt text out of the log entirely.
+first line of the latest prompt stands in. When the agent stops, its last reply
+is kept as an automatic handoff; ``handoff`` records one in its own words and,
+unlike the automatic one, lands in the committed copy right away. The
+repository may be public, so set ``AGENT_LOG_PROMPTS=0`` (e.g. under "env" in
+.claude/settings.json) to keep prompts and replies out of the log entirely.
 
 Only the standard library is used, so hooks work before anything is installed.
 """
@@ -44,6 +52,8 @@ EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 MAX_PROMPTS = 10
 MAX_FILES = 40
 PROMPT_CHARS = 120
+REPLY_CHARS = 600
+BRIEF_SESSIONS = 3  # how many recent sessions a new session is briefed on
 STALE_AFTER = 6 * 3600  # an open session silent for this long is shown as stale
 HIDE_ENDED_AFTER = 3 * 24 * 3600
 
@@ -161,9 +171,47 @@ def new_entry(session: str) -> Dict[str, Any]:
         "task_source": None,
         "started_at": stamp,
         "updated_at": stamp,
+        "start_commit": None,
         "prompts": [],
         "files": [],
+        "last_reply": None,  # automatic handoff: the agent's last message when it stopped
+        "handoff": None,  # explicit handoff written with `handoff`
     }
+
+
+def last_reply(payload: Dict[str, Any]) -> Optional[str]:
+    """The agent's final message for this turn, from the hook payload or the transcript."""
+    text = payload.get("last_assistant_message")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+    path = payload.get("transcript_path")
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(f.tell() - 512_000, 0))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    for line in reversed(lines):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(record, dict) or record.get("type") != "assistant":
+            continue
+        content = (record.get("message") or {}).get("content")
+        if isinstance(content, str):
+            parts = [content]
+        elif isinstance(content, list):
+            parts = [c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"]
+        else:
+            parts = []
+        text = "\n".join(p for p in parts if p.strip()).strip()
+        if text:
+            return text
+    return None
 
 
 def relative(root: Path, path: Optional[str]) -> Optional[str]:
@@ -190,6 +238,7 @@ def handle_hook(payload: Dict[str, Any]) -> None:
 
     if event == "SessionStart":
         entry["status"] = "idle"
+        entry["start_commit"] = entry.get("start_commit") or git(root, "rev-parse", "--short", "HEAD") or None
     elif event == "UserPromptSubmit":
         entry["status"] = "working"
         text = first_line(payload.get("prompt", "")) if prompts_enabled() else ""
@@ -208,6 +257,9 @@ def handle_hook(payload: Dict[str, Any]) -> None:
         entry["files"] = files[-MAX_FILES:]
     elif event == "Stop":
         entry["status"] = "idle"
+        reply = last_reply(payload) if prompts_enabled() else None
+        if reply:
+            entry["last_reply"] = {"at": now_iso(), "text": clip(reply, REPLY_CHARS)}
     elif event == "SessionEnd":
         entry["status"] = "ended"
     else:
@@ -219,13 +271,12 @@ def handle_hook(payload: Dict[str, Any]) -> None:
     save(root, entry, commit_copy=event == "PostToolUse")
 
     if event == "SessionStart":
-        # SessionStart output becomes context for the new session: tell it who else is busy.
-        others = [s for s in active(collect(root)) if s["session"] != session]
-        if others:
-            print("Other agents working on this repository (tools/agent_log.py board):")
-            print(render(others))
-            print("Avoid editing files another active session is changing.")
-        print('Record your task when you start one: python3 tools/agent_log.py task "<one line>"')
+        # SessionStart output becomes the new session's context: this is the handoff.
+        text = brief(collect(root), me=session)
+        if text:
+            print(text)
+        print('Record your task: python3 tools/agent_log.py task "<one line>". '
+              'Before you finish, leave a handoff: python3 tools/agent_log.py handoff "<done / next / caveats>"')
 
 
 # -- board ---------------------------------------------------------------------
@@ -272,6 +323,36 @@ def active(sessions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [s for s in sessions if shown_status(s) in ("working", "idle")]
 
 
+def brief(sessions: List[Dict[str, Any]], me: Optional[str] = None, limit: int = BRIEF_SESSIONS) -> str:
+    """Where the latest sessions left off, and who is busy right now."""
+    others = [s for s in sessions if s["session"] != me]
+    lines: List[str] = []
+    recent = [s for s in others if s.get("handoff") or s.get("last_reply") or s.get("task")][:limit]
+    if recent:
+        lines.append("Handoff from recent agent sessions on this repository (newest first; "
+                     "working/idle ones are active now, avoid editing their files):")
+    for s in recent:
+        lines.append(
+            f"- {s['session'][:8]} on {s.get('branch') or '?'} ({shown_status(s)}, {ago(s.get('updated_at'))}): "
+            f"{clip(s.get('task') or '-', 100)}"
+        )
+        handoff, reply = s.get("handoff") or {}, s.get("last_reply") or {}
+        if handoff:
+            lines.append(f"  handoff ({ago(handoff.get('at'))}, at {handoff.get('head') or '?'}): "
+                         f"{clip(handoff.get('text', ''), 500)}")
+        if reply and (reply.get("at") or "") > (handoff.get("at") or ""):
+            lines.append(f"  last reply ({ago(reply.get('at'))}): {clip(reply.get('text', ''), 300)}")
+        files = list(reversed(s.get("files") or []))
+        if files:
+            lines.append(f"  files: {', '.join(files[:6])}" + (f" +{len(files) - 6}" if len(files) > 6 else ""))
+    shown = {s["session"] for s in recent}
+    busy = [s for s in active(others) if s["session"] not in shown]
+    if busy:
+        lines.append("Also active right now (avoid editing the files they are changing):")
+        lines.append(render(busy))
+    return "\n".join(lines)
+
+
 def render(sessions: List[Dict[str, Any]]) -> str:
     headers = ["SESSION", "BRANCH", "STATUS", "UPDATED", "TASK", "FILES"]
     rows = []
@@ -311,10 +392,7 @@ def cmd_hook(args: argparse.Namespace) -> int:
 
 def cmd_task(args: argparse.Namespace) -> int:
     root = repo_root(os.getcwd())
-    session = args.session or os.environ.get("CLAUDE_CODE_SESSION_ID")
-    if not session:
-        mine = [s for s in collect(root) if s.get("seen_in") == "here" and s.get("status") != "ended"]
-        session = mine[0]["session"] if mine else str(uuid.uuid4())
+    session = current_session(root, args.session)
     entry = load_entry(root, session) or new_entry(session)
     entry["task"], entry["task_source"] = " ".join(args.text), "agent"
     if entry.get("status") != "ended":
@@ -323,6 +401,41 @@ def cmd_task(args: argparse.Namespace) -> int:
     entry["updated_at"] = now_iso()
     save(root, entry, commit_copy=True)
     print(f"{session[:8]}: {entry['task']}")
+    return 0
+
+
+def current_session(root: Path, explicit: Optional[str]) -> str:
+    session = explicit or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if session:
+        return session
+    mine = [s for s in collect(root) if s.get("seen_in") == "here" and s.get("status") != "ended"]
+    return mine[0]["session"] if mine else str(uuid.uuid4())
+
+
+def cmd_handoff(args: argparse.Namespace) -> int:
+    root = repo_root(os.getcwd())
+    session = current_session(root, args.session)
+    entry = load_entry(root, session) or new_entry(session)
+    entry["handoff"] = {
+        "at": now_iso(),
+        "text": " ".join(args.text),
+        "head": git(root, "rev-parse", "--short", "HEAD") or None,
+    }
+    entry["branch"] = git(root, "rev-parse", "--abbrev-ref", "HEAD") or entry.get("branch")
+    entry["updated_at"] = now_iso()
+    save(root, entry, commit_copy=True)
+    print(f"{session[:8]} handoff: {entry['handoff']['text']}")
+    print(f"commit {session_file(root, session).relative_to(root)} with your work so the next session gets it")
+    return 0
+
+
+def cmd_brief(args: argparse.Namespace) -> int:
+    root = repo_root(os.getcwd())
+    if args.fetch:
+        git(root, "fetch", "--quiet", "--prune", "origin")
+    text = brief(collect(root), me=None if args.include_me else os.environ.get("CLAUDE_CODE_SESSION_ID"),
+                 limit=args.limit)
+    print(text or "no agent sessions recorded yet")
     return 0
 
 
@@ -354,6 +467,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("text", nargs="+")
     p.add_argument("--session", help="session id (default: $CLAUDE_CODE_SESSION_ID)")
     p.set_defaults(func=cmd_task)
+    p = sub.add_parser("handoff", help="record where this session leaves off (done / next / caveats)")
+    p.add_argument("text", nargs="+")
+    p.add_argument("--session", help="session id (default: $CLAUDE_CODE_SESSION_ID)")
+    p.set_defaults(func=cmd_handoff)
+    p = sub.add_parser("brief", help="the handoff a new session gets: recent sessions and who is busy")
+    p.add_argument("--fetch", action="store_true", help="git fetch first to see other machines' latest pushes")
+    p.add_argument("--limit", type=int, default=BRIEF_SESSIONS, help="how many recent sessions to show")
+    p.add_argument("--include-me", action="store_true", help="also show the current session")
+    p.set_defaults(func=cmd_brief)
     p = sub.add_parser("board", help="show who is working on what")
     p.add_argument("--all", action="store_true", help="include sessions that ended long ago")
     p.add_argument("--fetch", action="store_true", help="git fetch first to see other machines' latest pushes")

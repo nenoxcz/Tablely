@@ -150,7 +150,7 @@ def test_sessions_on_other_clones_and_worktrees_are_visible(tmp_path):
     subprocess.run(["git", "clone", "-q", str(remote), str(second)], check=True, capture_output=True)
     out = hook(second, "SessionStart", "eeeeeeee-0005")
     assert "dddddddd" in out and "build the submit daemon" in out and "tablely/daemon.py" in out
-    assert "eeeeeeee" not in out.split("board):", 1)[1].split("Avoid", 1)[0]  # not itself
+    assert "eeeeeeee" not in out  # a session is not briefed about itself
 
     # same machine, another worktree: seen live, before anything is committed
     worktree = tmp_path / "wt"
@@ -158,3 +158,49 @@ def test_sessions_on_other_clones_and_worktrees_are_visible(tmp_path):
     hook(worktree, "UserPromptSubmit", "ffffffff-0006", prompt="tune affinity")
     board = tool(first, "board")
     assert "ffffffff" in board and "tune affinity" in board and "feat/other" in board
+
+
+def test_last_reply_is_kept_as_an_automatic_handoff(tmp_path):
+    repo = make_repo(tmp_path / "repo")
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("\n".join(json.dumps(r) for r in [
+        {"type": "user", "message": {"role": "user", "content": "go"}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "Started."}]}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "name": "Bash"}]}},
+        {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "Done: planner tie-break fixed. Next: NUMA placement."}]}},
+    ]) + "\n")
+    hook(repo, "Stop", "a1a1a1a1-0008", transcript_path=str(transcript))
+    assert entry(repo, "a1a1a1a1-0008")["last_reply"]["text"] == "Done: planner tie-break fixed. Next: NUMA placement."
+    assert dirty(repo) == ""  # kept live only; the tree stays clean
+
+    hook(repo, "Stop", "b2b2b2b2-0009", transcript_path=str(transcript), env={"AGENT_LOG_PROMPTS": "0"})
+    assert entry(repo, "b2b2b2b2-0009")["last_reply"] is None
+
+    out = hook(repo, "SessionStart", "c3c3c3c3-0010")
+    assert "last reply" in out and "Next: NUMA placement." in out
+
+
+def test_explicit_handoff_reaches_the_next_session_on_another_machine(tmp_path):
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    first = make_repo(tmp_path / "first")
+    git(first, "remote", "add", "origin", str(remote))
+    sid = "d4d4d4d4-0011"
+    hook(first, "SessionStart", sid)
+    tool(first, "task", "speed up the planner", env={"CLAUDE_CODE_SESSION_ID": sid})
+    out = tool(first, "handoff", "done: share_cpus is O(n log n); next: benchmark 256 cores",
+               env={"CLAUDE_CODE_SESSION_ID": sid})
+    assert "commit .agents/sessions/d4d4d4d4.json" in out
+    assert committed(first, sid)["handoff"]["text"].startswith("done: share_cpus")
+    git(first, "add", ".agents")
+    git(first, "commit", "-q", "-m", "work")
+    git(first, "push", "-q", "origin", "main")
+
+    second = tmp_path / "second"
+    subprocess.run(["git", "clone", "-q", str(remote), str(second)], check=True, capture_output=True)
+    out = hook(second, "SessionStart", "e5e5e5e5-0012")
+    assert "speed up the planner" in out
+    assert "handoff (" in out and "next: benchmark 256 cores" in out
+    briefing = tool(second, "brief", env={"CLAUDE_CODE_SESSION_ID": "e5e5e5e5-0012"})
+    assert briefing.count("d4d4d4d4") == 1 and "e5e5e5e5" not in briefing

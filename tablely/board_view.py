@@ -132,3 +132,90 @@ def _clip(text: str, width: int) -> str:
 
 def _ago(seconds: float) -> str:
     return f"{_fmt.duration(max(seconds, 0))} ago"
+
+
+def render_brief(
+    data: Mapping[str, Any],
+    events: Sequence[Mapping[str, Any]],
+    now: Optional[float] = None,
+    hours: float = 24.0,
+    agent: Optional[str] = None,
+) -> str:
+    """A handoff for whoever picks up next: what runs now, what finished, what agents said.
+
+    Written to be pasted into an agent's context as-is.
+    """
+    now = time.time() if now is None else now
+    since = now - hours * 3600
+
+    def wanted(who: Optional[str]) -> bool:
+        return agent is None or who == agent
+
+    scope = f"last {hours:g}h" + (f", agent {agent}" if agent else "")
+    lines = [f"# Tablely brief ({time.strftime('%Y-%m-%d %H:%M', time.localtime(now))}, {scope})"]
+    pool = data.get("pool")
+    if pool:
+        mode = "backfill" if pool["backfill"] else "strict priority"
+        lines.append(
+            f"machine: {len(pool['cpus'])} core(s), GPUs [{','.join(pool['gpus']) or 'none'}], {mode}"
+        )
+
+    lines += ["", "## Now"]
+    jobs = [j for j in data.get("jobs", {}).values() if wanted(j["agent"])]
+    if not jobs:
+        lines.append("- nothing running or queued")
+    for job in sorted(jobs, key=lambda j: (j["state"] != RUNNING, -j["priority"], j["seq"])):
+        head = f"- [{job['agent']}] {job['name']}" + (f" ({job['task']})" if job.get("task") else "")
+        if job["state"] == RUNNING:
+            alloc = allocation_from_json(job.get("allocation"))
+            body = (
+                f"running on {_fmt.placement(alloc)}, cores {_fmt.cores(alloc)}, "
+                f"{_fmt.duration(now - (job.get('started_at') or now))} so far"
+            )
+            if job.get("progress"):
+                body += f"; progress: {job['progress']}"
+            if job.get("orphan"):
+                body += "; its runner is gone"
+        else:
+            body = f"waiting {_fmt.duration(now - (job.get('submitted_at') or now))}: {job.get('wait_reason') or '-'}"
+        lines.append(f"{head}: {body}")
+
+    recent = [e for e in events if e.get("t", 0) >= since and wanted(e.get("agent"))]
+    finished = [e for e in recent if e.get("event") in ("done", "fail", "stop")][-15:][::-1]
+    lines += ["", "## Finished (newest first)"]
+    if not finished:
+        lines.append("- nothing finished in this window")
+    for e in finished:
+        result = {"done": "ok", "stop": "cancelled"}.get(e["event"]) or e.get("detail") or "failed"
+        line = f"- {_clock(e)} [{e.get('agent')}] {e.get('job')}" + (f" ({e['task']})" if e.get("task") else "")
+        line += f": {result}"
+        if e.get("seconds") is not None and e["event"] == "done":
+            line += f" in {_fmt.duration(e['seconds'])}"
+        if e.get("progress"):
+            line += f"; last progress: {e['progress']}"
+        git = e.get("git")
+        if git:
+            line += f"; code {git['commit']}{'+dirty' if git.get('dirty') else ''}"
+            line += f" on {git['branch']}" if git.get("branch") else ""
+        if e["event"] == "fail" and e.get("log"):
+            line += f"; log {e['log']}"
+        lines.append(line)
+
+    notes = [e for e in recent if e.get("event") == "note"][-10:][::-1]
+    lines += ["", "## Notes from agents (newest first)"]
+    if not notes:
+        lines.append("- none")
+    for e in notes:
+        lines.append(f"- {_clock(e)} [{e.get('agent')}] {e.get('detail')}")
+
+    problems = [e for e in recent if e.get("event") in ("run-lost", "orphan-exit")]
+    if problems:
+        lines += ["", "## Problems"]
+        for e in problems[-5:][::-1]:
+            lines.append(f"- {_clock(e)} [{e.get('agent')}] {e.get('event')}: {e.get('detail')}")
+    return "\n".join(lines)
+
+
+def _clock(event: Mapping[str, Any]) -> str:
+    stamp = str(event.get("time", ""))
+    return stamp[11:16] if len(stamp) >= 16 else stamp

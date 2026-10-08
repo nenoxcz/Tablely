@@ -16,7 +16,7 @@ Tablely는 작업 목록을 받아서:
 3. **CPU 코어**: 작업마다 겹치지 않는 코어 집합을 주고 그 코어에 고정(CPU affinity)합니다. 스레드 수 환경변수(`OMP_NUM_THREADS` 등)도 맞춰줍니다.
 4. **중요도 비례 분배**: 최소 코어를 보장한 뒤 남는 코어는 중요도에 비례해 나눕니다.
 5. **재분배**: 작업이 끝날 때마다 다시 계획합니다. 대기 중인 작업을 시작하고, 실행 중인 작업의 코어를 늘리거나 줄입니다.
-6. **여러 에이전트**: 같은 머신에서 여러 에이전트(AI 에이전트나 사람)가 각자 `tablely run`을 해도 GPU와 코어를 함께 계획합니다. 누가 무엇을 왜 돌리고 있는지는 자동으로 기록합니다 (`tablely status`, `tablely history`).
+6. **여러 에이전트와 핸드오프**: 같은 머신에서 여러 에이전트(AI 에이전트나 사람)가 각자 `tablely run`을 해도 GPU와 코어를 함께 계획합니다. 누가 무엇을 왜 돌리고 있는지는 자동으로 기록합니다. 그래서 다음 에이전트는 따로 인수인계 문서를 받지 않아도 `tablely brief`로 이어받을 수 있습니다.
 
 ## 설치
 
@@ -196,7 +196,8 @@ tablely run vit.toml   --agent claude-b --task "vit augmentation study"
 
 tablely status                 # 지금 누가 무엇을 어디서 돌리는지 (--json 가능)
 tablely history                # 지난 기록 (--agent, --job, -n, --json)
-tablely note --agent claude-a "lr sweep 끝나면 baseline과 비교 예정"   # 지금 하는 일 메모
+tablely note --agent claude-a "lr sweep 끝나면 baseline과 비교 예정"   # 지금 하는 일, 다음 할 일 메모
+tablely brief                  # 다음 에이전트에게 넘길 핸드오프 요약 (--hours, --agent, --json)
 tablely plan vit.toml          # 다른 에이전트의 작업을 고려한 배치 미리보기
 ```
 
@@ -228,6 +229,29 @@ TIME                 AGENT     EVENT      JOB           DETAIL                  
 2026-10-08 05:32:03  claude-a  done       lr-1e-3       ok in 4s                      resnet lr sweep
 2026-10-08 05:32:03  claude-b  start      vit-aug       prio 9 GPU 0 cores 0 (1)      vit augmentation study
 ```
+
+### 핸드오프: `tablely brief`
+
+에이전트가 바뀌거나 세션이 끝나도 따로 인수인계 문서를 쓸 필요가 없습니다. 새로 온 에이전트는 `tablely brief` 출력을 그대로 컨텍스트에 넣으면 됩니다.
+
+```
+# Tablely brief (2026-10-08 07:10, last 24h)
+machine: 4 core(s), GPUs [0], strict priority
+
+## Now
+- [claude-b] vit-mixup (vit augmentation study): running on GPU 0, cores 0 (1), 3s so far; progress: epoch 1/3
+
+## Finished (newest first)
+- 07:10 [claude-a] lr-1e-3 (resnet lr sweep): ok in 4s; last progress: epoch 3/3
+
+## Notes from agents (newest first)
+- 07:10 [claude-a] lr 1e-3 is best so far; next: try 3e-4 with warmup
+```
+
+- **Now**: 지금 돌고 있거나 기다리는 작업과 그 진행 상황입니다.
+- **Finished**: 끝난 작업의 결과입니다. 마지막으로 보고한 진행 상황(지표), 코드 커밋, 실패했다면 로그 위치가 함께 나옵니다.
+- **Notes**: 에이전트가 `tablely note`로 남긴 "다음에 할 일"입니다.
+- `--agent claude-a`로 한 에이전트의 작업만, `--hours 6`으로 최근 6시간만 볼 수 있습니다.
 
 세부 동작:
 
@@ -266,7 +290,7 @@ TIME                 AGENT     EVENT      JOB           DETAIL                  
 
 ## 이 저장소를 여러 코딩 에이전트로 개발할 때
 
-Claude Code 같은 코딩 에이전트 여러 개가 이 저장소를 동시에 작업하면, 각 에이전트가 지금 무엇을 하는지 자동으로 기록합니다. 설정은 `.claude/settings.json`의 hooks에 들어 있어서 저장소를 열면 바로 동작합니다.
+Claude Code 같은 코딩 에이전트 여러 개가 이 저장소를 동시에 작업하면, 각 에이전트가 지금 무엇을 하는지 자동으로 기록합니다. 이 기록이 세션 사이의 핸드오프 역할을 합니다. 설정은 `.claude/settings.json`의 hooks에 들어 있어서 저장소를 열면 바로 동작합니다.
 
 - 세션마다 `.agents/sessions/<세션ID 앞 8자리>.json` 파일 하나에 다음을 남깁니다.
   - 브랜치
@@ -276,10 +300,17 @@ Claude Code 같은 코딩 에이전트 여러 개가 이 저장소를 동시에 
   - 수정한 파일
 - 파일이 세션별로 나뉘어 있어서 여러 에이전트가 동시에 써도 충돌하지 않습니다. 작업과 함께 커밋하면 다른 머신의 에이전트도 그 브랜치에서 볼 수 있습니다.
 - 커밋되는 이 파일은 에이전트가 파일을 수정할 때만 갱신됩니다. 그래서 로그 때문에 작업 트리가 혼자 더러워지는 일은 없습니다. 상태와 프롬프트 같은 실시간 정보는 커밋되지 않는 `.git/agent-sessions/`에 바로 반영되고, 같은 clone의 모든 worktree가 이 디렉터리를 함께 봅니다.
-- 새 세션이 시작되면 다른 에이전트들이 지금 하는 일을 자동으로 보여줍니다. 대상은 이 체크아웃, 같은 clone의 다른 worktree, 모든 원격 브랜치입니다.
+- **새 세션은 첫 프롬프트 전에 핸드오프를 자동으로 받습니다.** 대상은 이 체크아웃, 같은 clone의 다른 worktree, 모든 원격 브랜치입니다. 받는 내용은 다음과 같습니다.
+  - 최근 세션 3개가 무엇을 하고 있었고 어디서 멈췄는지
+  - 어떤 파일을 고쳤는지
+  - 지금 누가 작업 중인지
+- 어디서 멈췄는지는 두 가지 방법으로 남습니다.
+  - **자동**: 에이전트가 응답을 마칠 때 마지막 답변(최대 600자)이 남습니다.
+  - **직접**: 작업을 마치기 전에 `python3 tools/agent_log.py handoff "끝낸 것 / 다음 할 것 / 주의할 점"`으로 적습니다. 직접 적은 핸드오프는 바로 커밋할 사본에 들어갑니다. 그래서 작업과 함께 푸시하면 다른 머신의 새 세션도 받습니다.
+- 새 세션이 받는 내용을 미리 보려면: `python3 tools/agent_log.py brief`
 - 작업 내용은 에이전트가 직접 적은 것이 우선입니다: `python3 tools/agent_log.py task "NUMA 인지 코어 배정"`. 적은 게 없으면 최근 프롬프트 첫 줄을 씁니다.
 - 전체 현황: `python3 tools/agent_log.py board` (`--fetch`를 붙이면 원격을 먼저 가져옴, `--all`이면 오래전에 끝난 세션도 표시)
-- 이 저장소는 공개 저장소이므로 프롬프트 첫 줄(최대 120자)도 커밋되면 공개됩니다. 남기기 싫으면 `.claude/settings.json`의 `"env"`에 `"AGENT_LOG_PROMPTS": "0"`을 넣으세요. 그러면 에이전트가 `task`로 적은 내용만 남습니다.
+- 이 저장소는 공개 저장소이므로 프롬프트 첫 줄(최대 120자)과 에이전트의 마지막 답변도 커밋되면 공개됩니다. 남기기 싫으면 `.claude/settings.json`의 `"env"`에 `"AGENT_LOG_PROMPTS": "0"`을 넣으세요. 그러면 에이전트가 `task`와 `handoff`로 직접 적은 내용만 남습니다.
 
 ## 한계와 다음 단계
 

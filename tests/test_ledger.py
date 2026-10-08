@@ -249,3 +249,33 @@ def test_cli_plan_accounts_for_jobs_already_running(tmp_path, capsys, isolated_t
     # an explicit machine description is a what-if: other agents are ignored
     assert main(["plan", str(jobfile), "--gpus", "1"]) == 0
     assert "start" in capsys.readouterr().out
+
+
+def test_brief_hands_over_results_progress_and_notes(tmp_path, capsys, isolated_tablely_home):
+    ledger = Ledger(isolated_tablely_home)
+    report = f"""
+        import sys
+        sys.path.insert(0, {os.getcwd()!r})
+        from tablely import client
+        client.progress("epoch 5/5, val acc 0.91")
+    """
+    jobs = [
+        JobSpec(name="good", command=py(report), device="cpu", task="baseline"),
+        JobSpec(name="bad", command=py("raise SystemExit(3)"), device="cpu"),
+    ]
+    me = runner(tmp_path, jobs, ledger, "claude-a", task="lr sweep")
+    assert me.run() == 1
+    assert main(["note", "--agent", "claude-a", "next: try lr 3e-4"]) == 0
+    capsys.readouterr()
+
+    done = next(e for e in ledger.history() if e["event"] == "done")
+    assert done["progress"] == "epoch 5/5, val acc 0.91"  # survives the job
+
+    assert main(["brief"]) == 0
+    text = capsys.readouterr().out
+    assert "nothing running or queued" in text
+    assert "[claude-a] good (baseline): ok" in text and "last progress: epoch 5/5, val acc 0.91" in text
+    assert "[claude-a] bad (lr sweep): exit 3" in text
+    assert "next: try lr 3e-4" in text
+    assert main(["brief", "--agent", "someone-else"]) == 0
+    assert "nothing finished in this window" in capsys.readouterr().out
