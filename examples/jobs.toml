@@ -5,6 +5,7 @@
 
 log_dir = "logs"       # one <job>.log per job, relative to this file
 backfill = false       # true = lower-priority jobs may use resources a waiting job is queued for
+switch_grace = 30      # a switchable job runs at least this long before it is asked to move
 task = "example batch" # what this run is for; other agents see it in `tablely status`
 
 [resources]
@@ -18,6 +19,7 @@ command = "python3 fake_train.py --device {device} --seconds 20"
 priority = 10          # most important: gets a GPU first
 device = "gpu"         # GPU only: waits if none is free
 gpus = 1
+# max_gpus = "all"     # take every GPU nobody waits for (use {num_gpus}, e.g. torchrun --nproc_per_node {num_gpus})
 cpus = 4               # cores for data loading; GPU jobs stay at this unless max_cpus is set
 task = "finetune on the new data mix"   # per-job purpose (default: the task above)
 
@@ -38,7 +40,8 @@ cpus = 2               # minimum; spare cores are added in proportion to priorit
 
 [[jobs]]
 name = "tabular-mlp"
-command = "python3 fake_train.py --device {device} --seconds 6"
+command = "python3 stream_train.py --epochs 3"   # streams its data in chunks (tablely.stream)
 priority = 1
 device = "any"
 cpus = 1
+switchable = true      # may be moved to a GPU when one frees up (checkpoint + restart)

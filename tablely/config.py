@@ -17,7 +17,7 @@ if sys.version_info >= (3, 11):
 else:  # pragma: no cover
     import tomli as tomllib
 
-_TOP_KEYS = {"resources", "jobs", "log_dir", "backfill", "task"}
+_TOP_KEYS = {"resources", "jobs", "log_dir", "backfill", "task", "switch_grace", "max_switches"}
 _RESOURCE_KEYS = {"cpus", "gpus", "reserve_cpus"}
 _JOB_KEYS = {
     "name", "command", "priority", "device", "gpus", "max_gpus", "cpus", "max_cpus",
@@ -38,6 +38,8 @@ class Config:
     gpus: GpuSetting = None
     reserve_cpus: int = 0
     task: Optional[str] = None  # what this batch is for; jobs without their own task inherit it
+    switch_grace: float = 60.0  # seconds a switchable job runs before it may be asked to move
+    max_switches: int = 5  # device switches per job before it is no longer asked
 
     def inventory(self, simulate: bool = False) -> Inventory:
         try:
@@ -94,6 +96,13 @@ def parse_config(data: Any, base_dir: Union[str, Path] = ".") -> Config:
     if task is not None and not isinstance(task, str):
         raise ConfigError("task must be a string")
 
+    switch_grace = data.get("switch_grace", 60.0)
+    if isinstance(switch_grace, bool) or not isinstance(switch_grace, (int, float)) or switch_grace < 0:
+        raise ConfigError("switch_grace must be a non-negative number of seconds")
+    max_switches = data.get("max_switches", 5)
+    if isinstance(max_switches, bool) or not isinstance(max_switches, int) or max_switches < 0:
+        raise ConfigError("max_switches must be a non-negative integer")
+
     log_dir = Path(str(data.get("log_dir", "tablely-logs")))
     reserve = resources.get("reserve_cpus", 0)
     if isinstance(reserve, bool) or not isinstance(reserve, int):
@@ -106,6 +115,8 @@ def parse_config(data: Any, base_dir: Union[str, Path] = ".") -> Config:
         gpus=resources.get("gpus"),
         reserve_cpus=reserve,
         task=task,
+        switch_grace=float(switch_grace),
+        max_switches=max_switches,
     )
 
 

@@ -44,8 +44,20 @@ def test_yaml_and_json(tmp_path):
         ({"jobs": [{"name": "bad name", "command": "x"}]}, "invalid job name"),
         ({"jobs": [{"name": "a", "command": ["x"], "shell": True}]}, "single string"),
         ({"resources": {"cores": 4}, "jobs": [{"name": "a", "command": "x"}]}, "unknown key"),
+        ({"switch_grace": -1, "jobs": [{"name": "a", "command": "x"}]}, "switch_grace"),
+        ({"jobs": [{"name": "a", "command": "x", "max_gpus": "lots"}]}, "max_gpus"),
     ],
 )
 def test_invalid_job_files_are_rejected(data, message):
     with pytest.raises(ConfigError, match=message):
         parse_config(data)
+
+
+def test_multi_gpu_and_switching_keys():
+    config = parse_config({
+        "switch_grace": 5, "max_switches": 2,
+        "jobs": [{"name": "a", "command": "x", "device": "any", "gpus": 2, "max_gpus": "all", "switchable": True}],
+    })
+    job = config.jobs[0]
+    assert (job.gpus, job.max_gpus, job.switchable) == (2, "all", True)
+    assert (config.switch_grace, config.max_switches) == (5.0, 2)

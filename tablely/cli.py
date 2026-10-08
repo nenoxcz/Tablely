@@ -181,6 +181,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
             ledger=Ledger(args.home),
             agent=args.agent,
             task=args.task or config.task,
+            switch_grace=config.switch_grace,
+            max_switches=config.max_switches,
         )
     except ValueError as exc:
         raise ConfigError(str(exc)) from None

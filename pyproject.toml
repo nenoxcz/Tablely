@@ -12,7 +12,8 @@ dependencies = ["tomli>=1.1; python_version < '3.11'"]
 
 [project.optional-dependencies]
 yaml = ["pyyaml>=5.1"]
-test = ["pytest>=7"]
+stream = ["numpy>=1.22"]  # tablely.stream; GPU streaming also needs torch with CUDA
+test = ["pytest>=7", "numpy>=1.22"]
 
 [project.scripts]
 tablely = "tablely.cli:main"

@@ -6,7 +6,7 @@
   "task": "Multi-GPU: elastic GPU counts, CPU<->GPU job switching, chunked streaming (disk->RAM->PCIe->GPU, L3-sized CPU blocks)",
   "task_source": "agent",
   "started_at": "2026-10-08T05:38:03Z",
-  "updated_at": "2026-10-08T07:17:15Z",
+  "updated_at": "2026-10-08T07:28:22Z",
   "prompts": [
     {
       "at": "2026-10-08T07:05:34Z",
@@ -17,11 +17,13 @@
       "text": "다중 GPU, 자동 GPU 분배랑 CPU 연산 전환 이런거. 순차적 업로드로 좀 큰 자료도 램이나 L3 캐시에 올리고 버스 태우거나 램을 사용해서 순차적업로드도 가능하게 ㅇㅇ"
     }
   ],
-  "files": [],
+  "files": [
+    "tablely/stream.py"
+  ],
   "handoff": {
-    "at": "2026-10-08T07:11:11Z",
-    "text": "끝낸 것: tablely brief(실행중/결과/메모 요약), 작업 종료 이벤트에 마지막 진행상황·커밋 기록, agent_log handoff/brief 명령, 응답 끝날 때 마지막 답변 자동 저장. 다음: 선점(체크포인트 후 재개), 데몬/tablely submit, 실제 GPU 서버 검증. 주의: Stop hook은 커밋 대상 파일을 건드리면 안 됨(종료 검사와 무한 루프).",
-    "head": "004c401"
+    "at": "2026-10-08T07:28:22Z",
+    "text": "끝낸 것: max_gpus(남는 GPU 자동 분배), switchable 작업의 CPU<->GPU 협력 전환(exit 75, 요청 철회, grace/횟수 제한), tablely.stream(메모리맵->pinned RAM->PCIe->GPU, CPU는 L3 절반 크기, map_chunks 다중 GPU), examples/stream_train.py. 다음: 실제 GPU 서버에서 stream CUDA 경로 검증, GPU 전용 작업의 일반 선점, 데몬/tablely submit. 주의: torch/CUDA 경로는 테스트 환경에서 실행 불가(download.pytorch.org 차단).",
+    "head": "aee79c8"
   },
   "last_reply": {
     "at": "2026-10-08T07:11:27Z",
