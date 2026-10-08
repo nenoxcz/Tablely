@@ -16,6 +16,7 @@ Tablely는 작업 목록을 받아서:
 3. **CPU 코어**: 작업마다 겹치지 않는 코어 집합을 주고 그 코어에 고정(CPU affinity)합니다. 스레드 수 환경변수(`OMP_NUM_THREADS` 등)도 맞춰줍니다.
 4. **중요도 비례 분배**: 최소 코어를 보장한 뒤 남는 코어는 중요도에 비례해 나눕니다.
 5. **재분배**: 작업이 끝날 때마다 다시 계획합니다. 대기 중인 작업을 시작하고, 실행 중인 작업의 코어를 늘리거나 줄입니다.
+6. **여러 에이전트**: 같은 머신에서 여러 에이전트(AI 에이전트나 사람)가 각자 `tablely run`을 해도 GPU와 코어를 함께 계획합니다. 누가 무엇을 왜 돌리고 있는지는 자동으로 기록합니다 (`tablely status`, `tablely history`).
 
 ## 설치
 
@@ -116,6 +117,7 @@ TOML, YAML, JSON을 지원합니다. 전체 예시는 [`examples/jobs.toml`](exa
 ```toml
 log_dir = "logs"          # 작업별 로그 <name>.log (작업 파일 기준 상대경로)
 backfill = false
+task = "resnet lr sweep"  # 이 실행의 목적. 다른 에이전트가 status/history에서 봄 (--task로 덮어쓰기)
 
 [resources]               # 모두 생략 가능
 cpus = "0-15"             # 정수 = 앞에서부터 N개, 문자열/리스트 = 그 코어들. 기본: 사용 가능한 전체
@@ -133,6 +135,7 @@ max_cpus = 8              # 코어 상한 (기본: GPU면 cpus, CPU면 무제한
 env = { WANDB_PROJECT = "exp" }
 cwd = "."                 # 작업 디렉터리 (기본: 작업 파일이 있는 곳)
 shell = false             # true면 command를 셸로 실행 (파이프, && 등)
+task = "lr 1e-3, warmup 500"  # 이 작업만의 목적 (기본: 위의 task)
 ```
 
 `command`는 문자열 또는 리스트입니다. 아래 자리표시자는 작업 시작 시점의 값으로 바뀝니다.
@@ -146,7 +149,7 @@ shell = false             # true면 command를 셸로 실행 (파이프, && 등)
 | `{cpu_list}` | 코어 목록 (`4-7`) |
 | `{name}` | 작업 이름 |
 
-CLI 옵션 `--cpus`, `--gpus`, `--reserve-cpus`, `--backfill`, `--log-dir`는 작업 파일 설정보다 우선합니다.
+CLI 옵션 `--cpus`, `--gpus`, `--reserve-cpus`, `--backfill`, `--log-dir`, `--task`는 작업 파일 설정보다 우선합니다.
 
 ## 학습 스크립트와 연동
 
@@ -160,6 +163,8 @@ Tablely는 작업마다 다음 환경변수를 넣어 줍니다.
 | `TABLELY_DEVICE` | `cuda` 또는 `cpu` |
 | `TABLELY_GPUS`, `TABLELY_NUM_CPUS`, `TABLELY_CPU_LIST` | 배정 내역 |
 | `TABLELY_JOB`, `TABLELY_PRIORITY` | 작업 이름, 중요도 |
+| `TABLELY_AGENT`, `TABLELY_TASK` | 이 작업을 띄운 에이전트, 작업 목적 |
+| `TABLELY_HOME`, `TABLELY_RUN`, `TABLELY_JOB_KEY` | 공용 장부 위치와 이 작업의 키 (`client.progress`가 사용) |
 
 환경변수만 읽어도 되지만, 선택적으로 쓸 수 있는 헬퍼도 있습니다.
 
@@ -172,9 +177,66 @@ model.to(device)
 for epoch in range(epochs):
     client.sync_torch_threads()  # 코어가 늘거나 줄었으면 torch 스레드 수를 맞춤
     ...
+    client.progress(f"epoch {epoch + 1}/{epochs}, val acc {acc:.3f}")  # tablely status에 표시
 ```
 
 `any` 작업을 쓸 때는 장치에 따라 배치 크기 등을 바꾸고 싶을 수 있습니다. 그럴 때는 `command`에 `--device {device}`를 넘겨서 스크립트에서 분기하면 됩니다.
+
+## 여러 에이전트가 한 머신을 같이 쓸 때
+
+AI 에이전트 여러 개(또는 사람)가 같은 머신에서 각자 `tablely run`을 실행해도 됩니다. 모든 `tablely run`은 머신 공용 장부(`~/.tablely`, `TABLELY_HOME` 또는 `--home`으로 변경)에 자동으로 등록됩니다. 그래서 따로 설정하지 않아도 다음이 됩니다.
+
+- **자원을 같이 계획합니다.** 다른 에이전트가 쓰고 있는 GPU와 코어는 건드리지 않습니다. 중요도는 에이전트 구분 없이 비교하고, 코어 재분배도 머신 전체 기준으로 합니다.
+- **누가 무엇을 하는지 자동으로 기록합니다.** 에이전트 이름, 목적(task), 배정된 GPU와 코어, 시작·종료·실패·코어 변경, 코드 버전(git 커밋, 브랜치, 수정 여부), 학습 진행 상황을 남깁니다.
+
+```bash
+# 에이전트마다 이름과 목적을 붙여서 실행 (이름은 TABLELY_AGENT 환경변수로도 지정 가능)
+tablely run sweep.toml --agent claude-a --task "resnet lr sweep"
+tablely run vit.toml   --agent claude-b --task "vit augmentation study"
+
+tablely status                 # 지금 누가 무엇을 어디서 돌리는지 (--json 가능)
+tablely history                # 지난 기록 (--agent, --job, -n, --json)
+tablely note --agent claude-a "lr sweep 끝나면 baseline과 비교 예정"   # 지금 하는 일 메모
+tablely plan vit.toml          # 다른 에이전트의 작업을 고려한 배치 미리보기
+```
+
+`tablely status` 예시 (GPU 1장 머신에서 두 에이전트가 동시에 실행):
+
+```
+machine: 4 CPU core(s) [0-3], 1 GPU(s) [0]   policy: strict priority
+
+agents:
+  AGENT     RUNS  RUNNING  WAITING  TASK                    NOTE
+  claude-a  1     1        0        resnet lr sweep         -
+  claude-b  1     1        1        vit augmentation study  -
+
+jobs:
+  AGENT     JOB           TASK                    PRIO  STATE    ON     CORES    TIME  INFO
+  claude-a  lr-1e-3       resnet lr sweep         5     running  GPU 0  0 (1)    2s    epoch 3/3 (0s ago)
+  claude-b  feature-prep  precompute features     2     running  CPU    1-3 (3)  2s    epoch 3/3 (0s ago)
+  claude-b  vit-aug       vit augmentation study  9     waiting  -      -        2s    needs 1 GPU(s), 0 free
+```
+
+`tablely history` 예시:
+
+```
+TIME                 AGENT     EVENT      JOB           DETAIL                        TASK
+2026-10-08 05:32:00  claude-a  start      lr-1e-3       prio 5 GPU 0 cores 0 (1)      resnet lr sweep
+2026-10-08 05:32:00  claude-b  start      feature-prep  prio 2 CPU cores 1-3 (3)      precompute features
+2026-10-08 05:32:00  claude-b  wait       vit-aug       needs 1 GPU(s), 0 free        vit augmentation study
+2026-10-08 05:32:02  claude-a  note       -             lr sweep 끝나면 baseline과 비교 예정
+2026-10-08 05:32:03  claude-a  done       lr-1e-3       ok in 4s                      resnet lr sweep
+2026-10-08 05:32:03  claude-b  start      vit-aug       prio 9 GPU 0 cores 0 (1)      vit augmentation study
+```
+
+세부 동작:
+
+- 처음 실행된 `tablely run`이 머신의 자원 풀(코어, GPU, 정책)을 정합니다. 누군가 실행 중인 동안에는 나중에 온 에이전트도 그 풀을 따릅니다.
+- 더 중요한 작업이 와도 다른 에이전트가 이미 돌리고 있는 작업은 멈추지 않습니다 (선점 없음). 위 예시처럼 기다렸다가 자원이 비면 시작합니다.
+- `tablely` 프로세스가 비정상 종료되면(`kill -9` 등), 그 실행의 대기 작업은 장부에서 지워집니다. 이미 돌고 있던 작업은 `orphan`으로 표시되고, 끝날 때까지 자원을 계속 차지합니다. 그 GPU에 다른 작업이 올라가지 않게 하기 위해서입니다.
+- 학습 스크립트에서 `client.progress(...)`를 부르면 status에 진행 상황이 나옵니다. 공용 파일을 잠그고 쓰므로 스텝마다가 아니라 에폭마다 정도로 부르세요.
+- 장부 디렉터리에는 `state.json`(현재 상태)과 `history.jsonl`(이벤트, 한 줄에 JSON 하나)이 있습니다. 파일 잠금(`flock`)으로 동시 접근을 막습니다.
+- 같은 머신의 같은 사용자끼리만 공유됩니다. 다른 머신과는 공유되지 않습니다.
 
 ## 그 밖의 동작
 
@@ -191,19 +253,38 @@ for epoch in range(epochs):
 | `tablely/spec.py` | `JobSpec`: 작업 정의와 검증 |
 | `tablely/resources.py` | CPU/GPU 감지, `Inventory` |
 | `tablely/planner.py` | 배분 로직 (순수 함수, I/O 없음 → 테스트/미리보기 용이) |
-| `tablely/runner.py` | 프로세스 실행, 감시, 재분배, 종료 처리 |
+| `tablely/runner.py` | 프로세스 실행, 감시, 재분배, 종료 처리 (공용 장부를 통해 다른 에이전트와 함께 계획) |
+| `tablely/ledger.py` | 머신 공용 장부: 실행/작업 등록, 죽은 실행 정리, 이벤트 기록 |
+| `tablely/board_view.py` | `tablely status` / `history` 출력 |
 | `tablely/affinity.py` | 프로세스 그룹 전체 코어 고정 (Linux) |
 | `tablely/config.py` | TOML/YAML/JSON 작업 파일 로딩 |
-| `tablely/cli.py` | `tablely resources / plan / run` |
-| `tablely/client.py` | 학습 스크립트용 선택적 헬퍼 |
+| `tablely/cli.py` | `tablely resources / plan / run / status / history / note` |
+| `tablely/client.py` | 학습 스크립트용 선택적 헬퍼 (`device`, `progress`, `note` ...) |
+| `tools/agent_log.py` | 이 저장소를 개발하는 코딩 에이전트의 작업 기록 (아래 참고) |
 
 테스트: `pip install -e '.[test,yaml]' && pytest`
 
+## 이 저장소를 여러 코딩 에이전트로 개발할 때
+
+Claude Code 같은 코딩 에이전트 여러 개가 이 저장소를 동시에 작업하면, 각 에이전트가 지금 무엇을 하는지 자동으로 기록합니다. 설정은 `.claude/settings.json`의 hooks에 들어 있어서 저장소를 열면 바로 동작합니다.
+
+- 세션마다 `.agents/sessions/<세션ID 앞 8자리>.json` 파일 하나에 다음을 남깁니다.
+  - 브랜치
+  - 상태 (`working`: 작업 중, `idle`: 응답 끝, `ended`: 세션 종료)
+  - 작업 내용
+  - 최근 프롬프트 첫 줄
+  - 수정한 파일
+- 파일이 세션별로 나뉘어 있어서 여러 에이전트가 동시에 써도 충돌하지 않습니다. 작업과 함께 커밋하면 다른 머신의 에이전트도 그 브랜치에서 볼 수 있습니다.
+- 새 세션이 시작되면 다른 에이전트들이 지금 하는 일을 자동으로 보여줍니다. 대상은 이 체크아웃, 같은 clone의 다른 worktree, 모든 원격 브랜치입니다.
+- 작업 내용은 에이전트가 직접 적은 것이 우선입니다: `python3 tools/agent_log.py task "NUMA 인지 코어 배정"`. 적은 게 없으면 최근 프롬프트 첫 줄을 씁니다.
+- 전체 현황: `python3 tools/agent_log.py board` (`--fetch`를 붙이면 원격을 먼저 가져옴, `--all`이면 오래전에 끝난 세션도 표시)
+- 이 저장소는 공개 저장소이므로 프롬프트 첫 줄(최대 120자)도 커밋되면 공개됩니다. 남기기 싫으면 `.claude/settings.json`의 `"env"`에 `"AGENT_LOG_PROMPTS": "0"`을 넣으세요. 그러면 에이전트가 `task`로 적은 내용만 남습니다.
+
 ## 한계와 다음 단계
 
-지금은 "작업 목록을 받아 끝까지 돌리는 배치 실행기"입니다. 서브시스템으로 키우려면 이런 것들이 다음 후보입니다.
+지금은 에이전트마다 `tablely run`이 자기 작업 목록을 끝까지 돌리고, 머신 공용 장부로 서로 조율하는 구조입니다. 서브시스템으로 키우려면 이런 것들이 다음 후보입니다.
 
-- **데몬 + `tablely submit`**: 실행 중에 작업을 추가하거나 취소하고, 상태를 조회 (`tablely status`).
+- **데몬 + `tablely submit`**: 이미 돌고 있는 실행에 작업을 추가하거나 취소. 지금은 새 작업 목록마다 `tablely run`을 하나 더 띄워야 합니다.
 - **선점(preemption)**: 더 중요한 작업이 나중에 들어왔을 때 덜 중요한 작업을 체크포인트 후 멈추고 나중에 재개. 지금은 실행 중인 작업을 멈추지 않습니다.
 - **CPU → GPU 이동**: CPU에서 시작한 `any` 작업은 나중에 GPU가 비어도 옮겨가지 않습니다. 선점과 같은 체크포인트/재시작 방식이 필요합니다.
 - **GPU 나눠 쓰기**: 작은 작업 여러 개가 한 GPU를 공유 (MPS, MIG, 메모리 비율 제한).
