@@ -1,0 +1,42 @@
+# Tablely job file example.
+#   tablely plan examples/jobs.toml        # preview placement (nothing runs)
+#   tablely run  examples/jobs.toml        # run everything
+# No GPU on this machine? Try:  tablely plan examples/jobs.toml --gpus 2 --cpus 16
+
+log_dir = "logs"       # one <job>.log per job, relative to this file
+backfill = false       # true = lower-priority jobs may use resources a waiting job is queued for
+
+[resources]
+# cpus = "0-15"        # default: every core this process may use
+# gpus = [0, 1]        # default: CUDA_VISIBLE_DEVICES, else nvidia-smi
+reserve_cpus = 1       # keep core 0 for the OS / Tablely itself
+
+[[jobs]]
+name = "llm-finetune"
+command = "python3 fake_train.py --device {device} --seconds 20"
+priority = 10          # most important: gets a GPU first
+device = "gpu"         # GPU only: waits if none is free
+gpus = 1
+cpus = 4               # cores for data loading; GPU jobs stay at this unless max_cpus is set
+
+[[jobs]]
+name = "vision-cnn"
+command = "python3 fake_train.py --device {device} --seconds 10"
+priority = 5
+device = "any"         # GPU if one is free, otherwise CPU
+cpus = 2
+max_cpus = 4
+
+[[jobs]]
+name = "xgboost-sweep"
+command = "python3 fake_train.py --device {device} --seconds 8 --threads {cpus}"
+priority = 3
+device = "cpu"         # CPU only; GPUs are hidden from it
+cpus = 2               # minimum; spare cores are added in proportion to priority
+
+[[jobs]]
+name = "tabular-mlp"
+command = "python3 fake_train.py --device {device} --seconds 6"
+priority = 1
+device = "any"
+cpus = 1

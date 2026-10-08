@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tablely"
+version = "0.1.0"
+description = "Run several training jobs on one machine, sharing GPUs and CPU cores by priority"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["tomli>=1.1; python_version < '3.11'"]
+
+[project.optional-dependencies]
+yaml = ["pyyaml>=5.1"]
+test = ["pytest>=7"]
+
+[project.scripts]
+tablely = "tablely.cli:main"
+
+[tool.setuptools]
+packages = ["tablely"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
