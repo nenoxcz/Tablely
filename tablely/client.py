@@ -9,13 +9,26 @@ make the common cases one-liners::
     device = client.device()          # "cuda" or "cpu", as Tablely decided
     client.sync_torch_threads()       # call now and then: follows core changes
     client.progress(f"epoch {e}/{n}, val acc {acc:.3f}")   # shown in `tablely status`
+
+Moving between CPU and GPU (jobs marked ``switchable = true``)::
+
+    start = load_checkpoint() if client.restarts() else 0
+    for epoch in range(start, epochs):
+        train_one_epoch()
+        if client.switch_requested():      # "gpu": one is free / "cpu": a bigger job needs it
+            save_checkpoint(epoch + 1)
+            client.exit_for_switch()       # Tablely restarts this job on the other device
 """
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 import time
-from typing import List, Optional
+from typing import List, NoReturn, Optional
+
+SWITCH_EXIT = 75  # must match tablely.runner.SWITCH_EXIT
 
 
 def is_managed() -> bool:
@@ -102,3 +115,47 @@ def note(text: str, who: Optional[str] = None) -> None:
                 os.environ.get("TABLELY_TASK"), text,
             )
         )
+
+
+def restarts() -> int:
+    """How many times this job was restarted to change devices (0 on the first run)."""
+    try:
+        return int(os.environ.get("TABLELY_RESTARTS", "0"))
+    except ValueError:
+        return 0
+
+
+def switch_requested() -> Optional[str]:
+    """``"gpu"`` or ``"cpu"`` when Tablely wants this job moved, else None.
+
+    Cheap (one small file read), so it can be checked every epoch or every few
+    hundred steps. Only asked of jobs marked ``switchable = true``.
+    """
+    path = os.environ.get("TABLELY_CONTROL")
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            target = json.load(f).get("switch_to")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return target if target in ("gpu", "cpu") else None
+
+
+def exit_for_switch(want: Optional[str] = None) -> NoReturn:
+    """End this run so Tablely restarts the job, after you saved a checkpoint.
+
+    Without ``want`` the job goes wherever Tablely asked (``switch_requested``).
+    ``want="cpu"`` keeps it on CPU from now on, e.g. after CUDA ran out of
+    memory. Outside a switchable Tablely job this is a plain ``exit(75)``.
+    """
+    reply = os.environ.get("TABLELY_REPLY")
+    if want is not None:
+        if want not in ("gpu", "cpu"):
+            raise ValueError('want must be "gpu" or "cpu"')
+        if reply:
+            with open(reply, "w", encoding="utf-8") as f:
+                json.dump({"want": want, "at": time.time()}, f)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    sys.exit(SWITCH_EXIT)

@@ -3,14 +3,18 @@
   "agent": "claude",
   "branch": "nenoxcz/kind-maxwell-onq8cl",
   "status": "working",
-  "task": "Make Tablely act as the handoff: brief for next agent, handoff notes, last results",
+  "task": "Multi-GPU: elastic GPU counts, CPU<->GPU job switching, chunked streaming (disk->RAM->PCIe->GPU, L3-sized CPU blocks)",
   "task_source": "agent",
   "started_at": "2026-10-08T05:38:03Z",
-  "updated_at": "2026-10-08T07:11:11Z",
+  "updated_at": "2026-10-08T07:17:15Z",
   "prompts": [
     {
       "at": "2026-10-08T07:05:34Z",
       "text": "그러니까 테이블리가 핸즈오프를 대신하는 느낌인거임."
+    },
+    {
+      "at": "2026-10-08T07:14:27Z",
+      "text": "다중 GPU, 자동 GPU 분배랑 CPU 연산 전환 이런거. 순차적 업로드로 좀 큰 자료도 램이나 L3 캐시에 올리고 버스 태우거나 램을 사용해서 순차적업로드도 가능하게 ㅇㅇ"
     }
   ],
   "files": [],
@@ -18,5 +22,9 @@
     "at": "2026-10-08T07:11:11Z",
     "text": "끝낸 것: tablely brief(실행중/결과/메모 요약), 작업 종료 이벤트에 마지막 진행상황·커밋 기록, agent_log handoff/brief 명령, 응답 끝날 때 마지막 답변 자동 저장. 다음: 선점(체크포인트 후 재개), 데몬/tablely submit, 실제 GPU 서버 검증. 주의: Stop hook은 커밋 대상 파일을 건드리면 안 됨(종료 검사와 무한 루프).",
     "head": "004c401"
+  },
+  "last_reply": {
+    "at": "2026-10-08T07:11:27Z",
+    "text": "네, 그렇게 이해하고 그 방향으로 맞췄습니다. 이전 세션이 손으로 핸드오프를 쓰지 않아도, 다음 에이전트가 Tablely에 쌓인 기록만 보고 이어받는 구조입니다. 변경은 푸시했고 테스트 69개가 모두 통과합니다. **학습을 돌리는 쪽: `tablely brief`** - 새로 온 에이전트가 컨텍스트에 그대로 넣을 수 있는 요약을 출력합니다. - 내용은 세 부분입니다. - 지금 돌고 있는 작업과 진행 상황 - 끝난 작업의 결과: 마지막 지표, 코드 커밋, 실패했다면 로그 위치 - 에이전트들이 `tablely note`로 남긴 \"다음에 할 일\" - 원래는 작업이 끝나면 마지막 진행 상황(예: `epoch 10/10, val acc 0.83`)이 사라졌는데, 이제 결과 기록에 남습니다. **코드를 고치는 쪽: 코딩 에이전트 세션 사이** - 새 세션은 첫 프롬프트 전에 핸드오프를 자동으로 받습니다. 최근 세션 3개가 무엇을 하다 어디서 멈췄는지, 어떤 파일을 고쳤는지, 지금 누가 작업 중인지가 들어 있습니다. - 어디서 멈췄는지는 두 가지 방법으로 남습니다. - **자동**: 에이전트가 응답을 마칠 때 마지막 답변이 저장됩니다. 다만 같은 머신 안에서만 보입니다…"
   }
 }

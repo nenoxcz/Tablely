@@ -137,6 +137,8 @@ class Board:
                 gpus=job["gpus"],
                 cpus=job["cpus"],
                 max_cpus=job["max_cpus"],
+                max_gpus=job.get("max_gpus"),
+                switchable=job.get("switchable", False),
             )
             if job["state"] == RUNNING:
                 running[key] = allocation_from_json(job["allocation"])

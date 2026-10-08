@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import enum
+import json
 import os
 import re
 import secrets
@@ -13,7 +15,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, TextIO, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple, Union
 
 from . import _fmt, affinity
 from .ledger import (
@@ -28,9 +30,9 @@ from .ledger import (
     make_event,
     process_identity,
 )
-from .planner import Allocation, Policy, check_feasible, plan
+from .planner import GPU, Allocation, Plan, Policy, check_feasible, plan
 from .resources import Inventory, format_cpu_list
-from .spec import JobSpec, format_priority
+from .spec import Device, JobSpec, format_priority
 
 THREAD_ENV_VARS = (
     "OMP_NUM_THREADS",
@@ -41,6 +43,8 @@ THREAD_ENV_VARS = (
 )
 
 _PLACEHOLDER = re.compile(r"\{(name|device|gpus|num_gpus|cpus|cpu_list)\}")
+
+SWITCH_EXIT = 75  # EX_TEMPFAIL: "checkpointed, restart me" (see client.exit_for_switch)
 
 
 class JobState(str, enum.Enum):
@@ -63,6 +67,9 @@ class JobRecord:
     returncode: Optional[int] = None
     wait_reason: Optional[str] = None
     error: Optional[str] = None
+    restarts: int = 0  # device switches so far
+    switch_requested: Optional[str] = None  # "gpu"/"cpu" asked of the running process
+    force_cpu: bool = False  # the job asked to stay on CPU (e.g. after running out of GPU memory)
 
 
 def job_values(spec: JobSpec, alloc: Allocation) -> Dict[str, str]:
@@ -166,6 +173,8 @@ class Runner:
         log_dir: Union[str, Path] = "tablely-logs",
         poll_interval: float = 0.5,
         stop_timeout: float = 10.0,
+        switch_grace: float = 60.0,
+        max_switches: int = 5,
         out: Optional[TextIO] = None,
         base_env: Optional[Mapping[str, str]] = None,
         ledger: Union[Ledger, MemoryLedger, None] = None,
@@ -180,6 +189,8 @@ class Runner:
         self.log_dir = Path(log_dir)
         self.poll_interval = poll_interval
         self.stop_timeout = stop_timeout
+        self.switch_grace = switch_grace  # a job runs at least this long before being asked to move
+        self.max_switches = max_switches
         self.out = out if out is not None else sys.stdout
         self.base_env = dict(os.environ if base_env is None else base_env)
         self.ledger = ledger if ledger is not None else MemoryLedger()
@@ -239,6 +250,8 @@ class Runner:
                 result = rec.error or f"exit {rec.returncode}"
             else:
                 result = rec.state.value
+            if rec.restarts:
+                result += f" ({rec.restarts} device switch{'es' if rec.restarts > 1 else ''})"
             took = (
                 _fmt.duration(rec.ended_at - rec.started_at)
                 if rec.started_at is not None and rec.ended_at is not None
@@ -311,6 +324,10 @@ class Runner:
             "gpus": spec.gpus,
             "cpus": spec.cpus,
             "max_cpus": spec.max_cpus,
+            "max_gpus": spec.max_gpus,
+            "switchable": spec.switchable,
+            "switch_requested": None,
+            "restarts": 0,
             "command": command_text(spec),
             "git": self._git.get(spec.cwd),
             "state": PENDING,
@@ -386,6 +403,7 @@ class Runner:
                 break  # otherwise re-plan: the failed job's resources are free again
 
         self._reconcile(board)
+        self._steer_switches(board, specs, decision)
         for name, rec in self.records.items():
             if rec.state is not JobState.PENDING:
                 continue
@@ -393,6 +411,74 @@ class Runner:
             if reason and reason != rec.wait_reason:
                 rec.wait_reason = reason
                 self._event("wait", rec, reason)
+
+    # -- device switching -----------------------------------------------------
+
+    def _control_files(self, name: str) -> Tuple[Path, Path]:
+        """(requests from Tablely to the job, the job's own wish) for job ``name``."""
+        return self.log_dir / f"{name}.control", self.log_dir / f"{name}.reply"
+
+    def _steer_switches(self, board: Board, specs: Mapping[str, JobSpec], decision: Plan) -> None:
+        """Ask switchable jobs to move between CPU and GPU, or take back a request.
+
+        Every runner computes the same wishes from the shared board and only
+        acts on its own jobs, so two agents never both claim one spare GPU.
+        """
+        wanted = _switch_wishes(board, specs, decision, self.inventory, time.time(),
+                                self.switch_grace, self.max_switches)
+        for name, rec in self.records.items():
+            if rec.state is not JobState.RUNNING or not rec.spec.switchable:
+                continue
+            key = self._keys[name]
+            target, reason = wanted.get(key, (None, None))
+            if target == rec.switch_requested:
+                continue
+            control, _ = self._control_files(name)
+            if target is None:
+                with contextlib.suppress(FileNotFoundError):
+                    control.unlink()
+                self._event("switch", rec, f"request to move to {rec.switch_requested} withdrawn")
+            else:
+                tmp = control.with_name(control.name + ".tmp")
+                tmp.write_text(json.dumps({"switch_to": target, "reason": reason, "at": time.time()}))
+                os.replace(tmp, control)
+                self._event("switch", rec, f"asked to checkpoint and move to {target.upper()}: {reason}")
+            rec.switch_requested = target
+            board.job(key)["switch_requested"] = target
+
+    def _requeue(self, rec: JobRecord, board: Board) -> None:
+        """The job checkpointed and exited to change devices: queue it again."""
+        name = rec.spec.name
+        _, reply = self._control_files(name)
+        try:
+            want = json.loads(reply.read_text()).get("want")
+        except (OSError, ValueError, AttributeError):
+            want = None
+        if want == "cpu" and rec.spec.device is Device.ANY:
+            rec.force_cpu = True
+        moved_from = _fmt.placement(rec.allocation)
+        asked = rec.switch_requested
+        rec.restarts += 1
+        rec.state = JobState.PENDING
+        rec.process = None
+        rec.allocation = None
+        rec.switch_requested = None
+        rec.wait_reason = None
+        entry = board.job(self._keys[name])
+        entry.update(
+            state=PENDING,
+            allocation=None,
+            pid=None,
+            pid_identity=None,
+            switch_requested=None,
+            restarts=rec.restarts,
+            wait_reason="restarting on another device",
+            device="cpu" if rec.force_cpu else rec.spec.device.value,
+        )
+        self._shadow[name] = entry
+        target = "CPU (job asked)" if rec.force_cpu else (asked.upper() if asked else "next free device")
+        self._event("requeue", rec, f"checkpointed on {moved_from}; restarting on {target} "
+                                    f"(switch {rec.restarts}/{self.max_switches})")
 
     def _reconcile(self, board: Board) -> None:
         """Apply core changes the board holds for our running jobs (whoever planned them)."""
@@ -408,14 +494,26 @@ class Runner:
         spec = rec.spec
         key = self._keys[spec.name]
         rec.log_path = self.log_dir / f"{spec.name}.log"
-        extra = {"TABLELY_AGENT": self.agent, "TABLELY_RUN": self.run_id, "TABLELY_JOB_KEY": key}
+        for path in self._control_files(spec.name):
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+        control, reply = self._control_files(spec.name)
+        extra = {
+            "TABLELY_AGENT": self.agent,
+            "TABLELY_RUN": self.run_id,
+            "TABLELY_JOB_KEY": key,
+            "TABLELY_SWITCHABLE": "1" if spec.switchable else "0",
+            "TABLELY_RESTARTS": str(rec.restarts),
+            "TABLELY_CONTROL": str(control.resolve()),
+            "TABLELY_REPLY": str(reply.resolve()),
+        }
         task = spec.task or self.task
         if task:
             extra["TABLELY_TASK"] = task
         if self.ledger.home is not None:
             extra["TABLELY_HOME"] = str(self.ledger.home)
         try:
-            with open(rec.log_path, "wb") as log:
+            with open(rec.log_path, "ab" if rec.restarts else "wb") as log:  # keep earlier attempts
                 rec.process = subprocess.Popen(
                     render_command(spec, alloc),
                     shell=spec.shell,
@@ -438,6 +536,7 @@ class Runner:
         rec.allocation = alloc
         rec.started_at = time.time()
         rec.wait_reason = None
+        rec.switch_requested = None
         entry = board.job(key)
         entry.update(
             state=RUNNING,
@@ -446,6 +545,7 @@ class Runner:
             pid_identity=process_identity(rec.process.pid),
             started_at=rec.started_at,
             wait_reason=None,
+            switch_requested=None,
             log=str(rec.log_path.resolve()),
         )
         self._shadow[spec.name] = entry
@@ -471,6 +571,11 @@ class Runner:
             if rec.state is not JobState.RUNNING or not _has_exited(rec.process):
                 continue
             code = self._finish(rec)
+            if code == SWITCH_EXIT and rec.spec.switchable:
+                if rec.restarts < self.max_switches:
+                    self._requeue(rec, board)
+                    continue
+                rec.error = f"asked to switch devices more than {self.max_switches} times"
             rec.state = JobState.SUCCEEDED if code == 0 else JobState.FAILED
             self._shadow[name] = board.job(self._keys[name]) or self._shadow[name]
             board.drop_job(self._keys[name])
@@ -544,6 +649,74 @@ class Runner:
         if stamp:
             text = f"[{time.strftime('%H:%M:%S')}] {text}"
         print(text, file=self.out, flush=True)
+
+
+def _switch_wishes(
+    board: Board,
+    specs: Mapping[str, JobSpec],
+    decision: Plan,
+    inventory: Inventory,
+    now: float,
+    grace: float,
+    max_switches: int,
+) -> Dict[str, Tuple[str, str]]:
+    """Which running switchable jobs (any agent) should move, as ``key -> (target, reason)``.
+
+    * up: a job that runs on CPU only because GPUs were busy moves to a GPU
+      nobody waits for, highest priority first;
+    * down: if a GPU-only job is waiting, lower-priority jobs that can run on
+      CPU give up their GPUs, lowest priority first — only if that frees enough.
+
+    Jobs already asked keep their place (so requests are stable), others must
+    have run ``grace`` seconds; a job stops being asked after ``max_switches``.
+    """
+    wishes: Dict[str, Tuple[str, str]] = {}
+
+    def movable(job: Dict[str, Any], on_gpu: bool, target: str) -> bool:
+        alloc = job.get("allocation") or {}
+        return (
+            job["state"] == RUNNING
+            and job.get("switchable")
+            and job["device"] == "any"
+            and not job.get("orphan")
+            and (alloc.get("device") == GPU) == on_gpu
+            and job.get("restarts", 0) < max_switches
+            and (job.get("switch_requested") == target or now - (job.get("started_at") or now) >= grace)
+        )
+
+    order = lambda kv: (-kv[1]["priority"], kv[1]["seq"])  # noqa: E731
+    spare = len(decision.spare_gpus)
+    for key, job in sorted(board.jobs.items(), key=order):
+        if movable(job, on_gpu=False, target="gpu") and job["gpus"] <= spare:
+            wishes[key] = ("gpu", f"{spare} GPU(s) free and nobody waiting for them")
+            spare -= job["gpus"]
+
+    blocked = sorted(
+        (k for k in decision.waiting if specs[k].device is Device.GPU),
+        key=lambda k: (-specs[k].priority, board.jobs[k]["seq"]),
+    )
+    if blocked:
+        top = blocked[0]
+        taken = {g for alloc in decision.allocations.values() for g in alloc.gpus}
+        need = specs[top].gpus - sum(1 for g in inventory.gpus if g not in taken)
+        candidates = sorted(
+            (
+                (k, j) for k, j in board.jobs.items()
+                if movable(j, on_gpu=True, target="cpu") and j["priority"] < specs[top].priority
+            ),
+            key=lambda kv: (kv[1].get("switch_requested") != "cpu", kv[1]["priority"], -kv[1]["seq"]),
+        )
+        picked, freed = [], 0
+        for key, job in candidates:
+            if freed >= need:
+                break
+            picked.append(key)
+            freed += len(job["allocation"]["gpus"])
+        if need > 0 and freed >= need:
+            for key in picked:
+                wishes[key] = ("cpu", f"higher-priority {board.jobs[top]['name']} "
+                                      f"({board.jobs[top]['agent']}) needs a GPU")
+    return wishes
 
 
 def _has_exited(proc: subprocess.Popen) -> bool:

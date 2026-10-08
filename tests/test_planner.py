@@ -209,3 +209,50 @@ def test_check_feasible():
     assert any("too-many-cores" in e for e in errors)
     assert any("duplicate" in e for e in errors)
     assert len(warnings) == 1 and "flex" in warnings[0]
+
+
+def test_elastic_job_takes_every_gpu_nobody_else_wants():
+    specs = jobs(job("big", device="gpu", gpus=1, max_gpus="all"), job("cpu-side", device="cpu"))
+    p = first_round(inv(gpus=4), specs)
+    assert p.allocations["big"].gpus == ("0", "1", "2", "3")
+    assert p.spare_gpus == []
+
+
+def test_elastic_gpus_are_split_by_priority_and_capped():
+    specs = jobs(
+        job("a", priority=3, device="gpu", gpus=1, max_gpus=8),
+        job("b", priority=1, device="gpu", gpus=1, max_gpus=2),
+    )
+    p = first_round(inv(gpus=8), specs)
+    assert len(p.allocations["b"].gpus) == 2  # capped
+    assert len(p.allocations["a"].gpus) == 6  # the rest
+    assert not set(p.allocations["a"].gpus) & set(p.allocations["b"].gpus)
+
+
+def test_no_elastic_growth_while_someone_waits_for_a_gpu():
+    # 5 GPUs, 2 busy: "needs4" cannot start, so the 2 GPUs left after the
+    # backfilled elastic job's minimum must stay free for it.
+    specs = jobs(
+        job("busy", priority=1, device="gpu", gpus=2),
+        job("needs4", priority=9, device="gpu", gpus=4),
+        job("elastic", priority=5, device="gpu", gpus=1, max_gpus="all"),
+    )
+    running = {"busy": Allocation("gpu", ("0", "1"), (0,))}
+    p = plan(inv(gpus=5), specs, running, ["needs4", "elastic"], Policy(backfill=True))
+    assert "needs4" in p.waiting
+    assert len(p.allocations["elastic"].gpus) == 1  # takes its minimum only
+    assert p.spare_gpus == []
+
+
+def test_spare_gpus_are_reported_when_nobody_waits():
+    specs = jobs(job("one", device="gpu"))
+    p = first_round(inv(gpus=3), specs)
+    assert p.spare_gpus == ["1", "2"]
+
+
+def test_max_gpus_validation():
+    with pytest.raises(ValueError, match="max_gpus"):
+        job("x", device="gpu", gpus=2, max_gpus=1)
+    with pytest.raises(ValueError, match="max_gpus"):
+        job("x", device="gpu", max_gpus="many")
+    assert job("c", device="cpu", max_gpus=4).max_gpus is None

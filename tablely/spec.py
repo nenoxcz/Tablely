@@ -26,6 +26,10 @@ class JobSpec:
     priority-2 job. ``cpus`` is the guaranteed minimum number of cores.
     ``max_cpus`` caps how many cores the job can grow to; when unset, a job
     placed on GPU stays at ``cpus`` and a job placed on CPU is uncapped.
+    ``gpus`` is the GPU count a job needs; with ``max_gpus`` (a number or
+    ``"all"``) it may be handed more at launch when no one else is waiting for
+    a GPU. ``switchable`` jobs can checkpoint and be restarted on another
+    device when Tablely asks (see ``client.switch_requested``).
     """
 
     name: str
@@ -39,6 +43,8 @@ class JobSpec:
     cwd: Optional[str] = None
     shell: bool = False
     task: Optional[str] = None  # what this job is for, shown to other agents
+    max_gpus: Optional[Union[int, str]] = None  # grow to this many GPUs at launch if free; "all" = no cap
+    switchable: bool = False  # supports checkpoint + restart on another device
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.match(self.name):
@@ -77,11 +83,27 @@ class JobSpec:
                 raise ValueError(f"{self.name}: max_cpus ({self.max_cpus}) is below cpus ({self.cpus})")
         if self.device is Device.CPU:
             object.__setattr__(self, "gpus", 0)
+            object.__setattr__(self, "max_gpus", None)
         elif self.gpus < 1:
             raise ValueError(f"{self.name}: gpus must be at least 1 for device {self.device.value!r}")
+        if self.max_gpus is not None and self.max_gpus != "all":
+            if not _is_int(self.max_gpus):
+                raise ValueError(f'{self.name}: max_gpus must be an integer or "all"')
+            if self.max_gpus < self.gpus:
+                raise ValueError(f"{self.name}: max_gpus ({self.max_gpus}) is below gpus ({self.gpus})")
+        if not isinstance(self.switchable, bool):
+            raise ValueError(f"{self.name}: switchable must be true or false")
         object.__setattr__(self, "env", {str(k): str(v) for k, v in dict(self.env).items()})
         if self.task is not None and not isinstance(self.task, str):
             raise ValueError(f"{self.name}: task must be a string")
+
+    def gpu_cap(self, total_gpus: int) -> int:
+        """Most GPUs this job can use on a machine with ``total_gpus``."""
+        if self.max_gpus is None:
+            return self.gpus
+        if self.max_gpus == "all":
+            return max(total_gpus, self.gpus)
+        return self.max_gpus
 
     def cpu_cap(self, on_gpu: bool) -> Optional[int]:
         """Upper bound on cores for this job given where it was placed (None = no cap)."""

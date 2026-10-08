@@ -14,7 +14,10 @@ One scheduling round:
    not take what it is waiting for — free GPUs stay reserved for it and its
    cores are set aside — so important jobs are never starved. With
    ``backfill`` lower-priority jobs may use those resources in the meantime.
-4. All cores are then split among the running jobs: everyone gets their
+4. GPUs still free when nobody is waiting for one go to jobs starting now
+   that accept more (``max_gpus``), in proportion to priority. A running job's
+   GPU set never changes.
+5. All cores are then split among the running jobs: everyone gets their
    minimum, and spare cores go out in proportion to priority (weighted
    max-min fairness), respecting each job's cap. Running jobs keep their GPUs
    but their core sets may grow or shrink; the cores they already hold are
@@ -23,7 +26,7 @@ One scheduling round:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 from .resources import Inventory
@@ -54,6 +57,7 @@ class Plan:
     allocations: Dict[str, Allocation]  # every job that should be running after this round
     started: List[str]  # newly admitted jobs, highest priority first
     waiting: Dict[str, str]  # pending job -> why it is not starting yet
+    spare_gpus: List[str] = field(default_factory=list)  # free, and no waiting job wants them
 
 
 def plan(
@@ -117,6 +121,10 @@ def plan(
         committed += spec.cpus
         started.append(name)
 
+    gpu_wanted = any(jobs[name].device is not Device.CPU for name in waiting)
+    if free_gpus and not gpu_wanted:
+        _grow_gpu_sets(jobs, started, placed, free_gpus, len(inventory.gpus))
+
     active = sorted(placed, key=by_priority)
     counts = share_cpus(
         total_cpus,
@@ -131,13 +139,39 @@ def plan(
         name: Allocation(device=placed[name][0], gpus=placed[name][1], cpus=cpu_sets[name])
         for name in active
     }
-    return Plan(allocations=allocations, started=started, waiting=waiting)
+    spare = [] if gpu_wanted else list(free_gpus)
+    return Plan(allocations=allocations, started=started, waiting=waiting, spare_gpus=spare)
+
+
+def _grow_gpu_sets(
+    jobs: Mapping[str, JobSpec],
+    started: Sequence[str],
+    placed: Dict[str, Tuple[str, Tuple[str, ...]]],
+    free_gpus: List[str],
+    total_gpus: int,
+) -> None:
+    """Hand GPUs nobody waits for to starting jobs that accept more, by priority."""
+    growable = [
+        name for name in started
+        if placed[name][0] == GPU and jobs[name].gpu_cap(total_gpus) > len(placed[name][1])
+    ]
+    if not growable:
+        return
+    have = [len(placed[name][1]) for name in growable]
+    counts = share_cpus(  # same weighted water-filling, applied to GPUs
+        sum(have) + len(free_gpus),
+        [(n, jobs[name].gpu_cap(total_gpus), jobs[name].priority) for name, n in zip(growable, have)],
+    )
+    for name, n, count in zip(growable, have, counts):
+        extra = tuple(free_gpus[: count - n])
+        del free_gpus[: count - n]
+        placed[name] = (GPU, placed[name][1] + extra)
 
 
 def share_cpus(total: int, demands: Sequence[Tuple[int, Optional[int], float]]) -> List[int]:
-    """Split ``total`` cores among ``(minimum, cap, weight)`` demands.
+    """Split ``total`` units (cores, or GPUs) among ``(minimum, cap, weight)`` demands.
 
-    Each demand gets its minimum, then spare cores go one at a time to the
+    Each demand gets its minimum, then spare units go one at a time to the
     demand with the fewest cores per unit of weight that is still below its
     cap. Ties favour earlier demands, so pass them highest priority first.
     Cores no one can take are left unassigned.

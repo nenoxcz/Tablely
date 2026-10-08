@@ -19,7 +19,10 @@ else:  # pragma: no cover
 
 _TOP_KEYS = {"resources", "jobs", "log_dir", "backfill", "task"}
 _RESOURCE_KEYS = {"cpus", "gpus", "reserve_cpus"}
-_JOB_KEYS = {"name", "command", "priority", "device", "gpus", "cpus", "max_cpus", "env", "cwd", "shell", "task"}
+_JOB_KEYS = {
+    "name", "command", "priority", "device", "gpus", "max_gpus", "cpus", "max_cpus",
+    "env", "cwd", "shell", "task", "switchable",
+}
 
 
 class ConfigError(ValueError):
