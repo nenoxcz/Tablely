@@ -3,10 +3,10 @@
   "agent": "claude",
   "branch": "nenoxcz/kind-maxwell-onq8cl",
   "status": "working",
-  "task": "Dashboard: completion %, Resume button that summarizes past work and hands it to an AI",
+  "task": "CLI-only: drop web dashboard; progress bars in tablely status, interactive tablely resume that starts the AI CLI",
   "task_source": "agent",
   "started_at": "2026-10-08T05:38:03Z",
-  "updated_at": "2026-10-10T06:42:17Z",
+  "updated_at": "2026-10-10T06:51:29Z",
   "prompts": [
     {
       "at": "2026-10-08T07:05:34Z",
@@ -19,6 +19,10 @@
     {
       "at": "2026-10-10T06:28:46Z",
       "text": "막 작업 하는거 달성률이나 그런걸로 보여주고, 재개하기 누르면 뭐 했었는지 요약해서 AI에게 넘겨주고 그런거"
+    },
+    {
+      "at": "2026-10-10T06:44:00Z",
+      "text": "그 CLI로 사용되는 느낌이야. UI가 그렇게 있는건 아니고"
     }
   ],
   "files": [
@@ -28,13 +32,30 @@
     "tablely/_dashboard_page.py"
   ],
   "handoff": {
-    "at": "2026-10-10T06:42:17Z",
-    "text": "끝낸 것: 진행률 숫자화(client.progress done/total, '3/10'/'45%' 해석), 실행·에이전트 달성률, tablely resume(요약 생성·저장·AI 실행), worklog를 tablely/worklog.py로 옮기고 할 일 목록(TaskCreate/TaskUpdate/TodoWrite)으로 세션 달성률, tablely ui 대시보드(재개하기 버튼, 토큰·Host 검사). 다음: 실제 GPU 서버에서 stream CUDA 경로 검증, 대시보드에서 실패 작업 재실행 버튼, 데몬/tablely submit. 주의: 대시보드 페이지는 서버 시작 시 읽으므로 고친 뒤 재시작 필요.",
-    "head": "e18c080"
+    "at": "2026-10-10T06:51:29Z",
+    "text": "끝낸 것: 웹 대시보드 제거(Tablely는 CLI 전용). tablely status를 달성률 막대 화면으로(실행별/작업별 막대, 최근 끝난 실행, 코딩 세션 할 일 달성률, 메모, --watch, 한글 폭 정렬). tablely resume: 번호로 고르거나 에이전트/실행/세션 id로 지정 -> 요약 저장 -> 확인 후 AI CLI(--ai, TABLELY_AI, 없으면 claude)를 같은 터미널에서 실행, --print/--yes. 다음: 실제 GPU 서버에서 stream CUDA 경로 검증, 실패 작업 재실행 명령, 데몬/tablely submit. 주의: 웹 UI는 커밋 e2d8266에 남아 있음, 다시 넣지 말 것(사용자 의도: CLI).",
+    "head": "e2d8266"
   },
   "last_reply": {
-    "at": "2026-10-08T07:28:40Z",
-    "text": "세 가지 모두 추가하고 푸시했습니다. 테스트 96개가 통과합니다. 다만 이 환경에는 GPU도 PyTorch도 없어서 **실제 GPU로 데이터를 보내는 부분은 아직 한 번도 실행되지 않았습니다.** PyTorch 다운로드 서버가 네트워크 정책으로 막혀 있었습니다. 그 주변의 순서·버퍼 관리 로직은 가짜 장치로 테스트했고, GPU 서버에서 처음 돌려볼 때 가장 먼저 확인할 부분입니다. **1. 다중 GPU와 자동 분배** - 작업 파일에 `gpus = 1`, `max_gpus = 4`(또는 `\"all\"`)를 적으면, 시작할 때 GPU를 기다리는 작업이 없으면 남는 GPU를 최대 4장까지 더 줍니다. 여러 작업이 걸리면 중요도 비례로 나눕니다. - 받은 장수는 `{num_gpus}`로 넘길 수 있습니다. 예: `torchrun --nproc_per_node {num_gpus} train.py` - 이미 실행 중인 작업의 GPU 수는 바뀌지 않습니다. **2. CPU ↔ GPU 연산 전환** 실행 중인 프로세스는 장치를 그 자리에서 바꿀 수 없어서, 작업과 Tablely가 협력하는 방식으로 만들었습니다. `switchable = true`로 표시한 작업에만 적용됩…"
+    "at": "2026-10-10T06:42:37Z",
+    "text": "진행 중인 작업을 달성률로 보여주는 대시보드와, 누르면 한 일을 요약해서 AI에게 넘기는 **재개하기** 버튼을 만들어 푸시했습니다. 방금 보낸 이미지가 실제 화면이고, 데이터는 데모용입니다. 헤드리스 Chromium에서 열어 재개하기 버튼까지 눌러 확인했고, 테스트 108개가 모두 통과합니다. **대시보드: `tablely ui`** - 실행하면 `http://127.0.0.1:8765`에 열리고 3초마다 갱신됩니다. GPU 서버라면 `ssh -L 8765:127.0.0.1:8765 서버`로 터널을 열어 보면 됩니다. - 화면에는 에이전트별, 실행별, 작업별 달성률 막대가 나옵니다. 저장소 안에서 띄우면 코딩 세션도 함께 보입니다. **달성률 계산 방식** - **학습 작업**: - 실행 하나의 달성률 = (끝난 작업 + 실행 중 작업의 진행률) ÷ 전체 작업 수입니다. - 진행률은 스크립트가 `client.progress(\"epoch 3/10\")`처럼 보고하면 자동으로 30%로 읽습니다. `done=3, total=10`처럼 숫자로 줘도 됩니다. - 실패하거나 취소된 작업은 0%로 칩니다. - **코딩 세션**: 에이전트가 쓰는 할 일 목록의 완료 비율…"
   },
-  "start_commit": "e18c080"
+  "start_commit": "e18c080",
+  "todos": [
+    {
+      "id": "6",
+      "subject": "Progress view in tablely status (bars, --watch)",
+      "status": "completed"
+    },
+    {
+      "id": "7",
+      "subject": "Interactive tablely resume (pick, summarize, start AI CLI)",
+      "status": "completed"
+    },
+    {
+      "id": "8",
+      "subject": "Tests, docs, handoff, commit",
+      "status": "in_progress"
+    }
+  ]
 }

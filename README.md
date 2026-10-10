@@ -18,7 +18,7 @@ Tablely는 작업 목록을 받아서:
 5. **재분배**: 작업이 끝날 때마다 다시 계획합니다. 대기 중인 작업을 시작하고, 실행 중인 작업의 코어를 늘리거나 줄입니다.
 6. **다중 GPU와 장치 전환**: GPU 여러 장을 한 작업에 줄 수 있고, 아무도 기다리지 않으면 남는 GPU를 더 줍니다 (`max_gpus`). 실행 중인 작업도 GPU가 비면 GPU로, 더 중요한 작업이 GPU를 기다리면 CPU로 옮깁니다 (체크포인트 후 재시작, `switchable`).
 7. **큰 데이터 순차 업로드**: GPU 메모리나 RAM보다 큰 데이터를 조각으로 나눠 디스크 → RAM → PCIe 버스 → GPU 순서로 계속 흘려 보냅니다. CPU에서는 L3 캐시에 맞는 크기로 쪼개서 처리합니다 (`tablely.stream`).
-8. **대시보드**: `tablely ui`로 작업마다 달성률(%)을 막대로 봅니다. **재개하기**를 누르면 지금까지 한 일을 요약해서 AI에게 넘겨줍니다 (복사하거나 AI를 바로 실행).
+8. **달성률과 재개하기 (CLI)**: `tablely status`로 작업마다 달성률(%)을 막대로 봅니다. `tablely resume`으로 이어갈 작업을 고르면, 지금까지 한 일을 요약해서 AI CLI(예: `claude`)에게 넘겨 바로 시작합니다.
 9. **여러 에이전트와 핸드오프**: 같은 머신에서 여러 에이전트(AI 에이전트나 사람)가 각자 `tablely run`을 해도 GPU와 코어를 함께 계획합니다. 누가 무엇을 왜 돌리고 있는지는 자동으로 기록합니다. 그래서 다음 에이전트는 따로 인수인계 문서를 받지 않아도 `tablely brief`로 이어받을 수 있습니다.
 
 ## 설치
@@ -196,7 +196,7 @@ model.to(device)
 for epoch in range(epochs):
     client.sync_torch_threads()  # 코어가 늘거나 줄었으면 torch 스레드 수를 맞춤
     ...
-    client.progress(f"epoch {epoch + 1}/{epochs}, val acc {acc:.3f}")  # tablely status와 대시보드에 표시
+    client.progress(f"epoch {epoch + 1}/{epochs}, val acc {acc:.3f}")  # tablely status에 달성률로 표시
 ```
 
 `client.progress`의 달성률(%)은 다음 순서로 정합니다.
@@ -297,31 +297,15 @@ AI 에이전트 여러 개(또는 사람)가 같은 머신에서 각자 `tablely
 tablely run sweep.toml --agent claude-a --task "resnet lr sweep"
 tablely run vit.toml   --agent claude-b --task "vit augmentation study"
 
-tablely status                 # 지금 누가 무엇을 어디서 돌리는지 (--json 가능)
+tablely status                 # 누가 무엇을 어디서 돌리는지와 달성률 막대 (--watch, --json)
 tablely history                # 지난 기록 (--agent, --job, -n, --json)
 tablely note --agent claude-a "lr sweep 끝나면 baseline과 비교 예정"   # 지금 하는 일, 다음 할 일 메모
 tablely brief                  # 다음 에이전트에게 넘길 핸드오프 요약 (--hours, --agent, --json)
-tablely resume --agent claude-a   # 그 에이전트가 한 일을 AI가 이어받을 수 있게 요약 (--run, --session, --launch)
-tablely ui                     # 웹 대시보드: 달성률, 재개하기 버튼
+tablely resume                 # 이어갈 작업을 골라 요약해서 AI CLI에게 넘김 (아래 참고)
 tablely plan vit.toml          # 다른 에이전트의 작업을 고려한 배치 미리보기
 ```
 
-`tablely status` 예시 (GPU 1장 머신에서 두 에이전트가 동시에 실행):
-
-```
-machine: 4 CPU core(s) [0-3], 1 GPU(s) [0]   policy: strict priority
-
-agents:
-  AGENT     RUNS  RUNNING  WAITING  TASK                    NOTE
-  claude-a  1     1        0        resnet lr sweep         -
-  claude-b  1     1        1        vit augmentation study  -
-
-jobs:
-  AGENT     JOB           TASK                    PRIO  STATE    ON     CORES    TIME  INFO
-  claude-a  lr-1e-3       resnet lr sweep         5     running  GPU 0  0 (1)    2s    epoch 3/3 (0s ago)
-  claude-b  feature-prep  precompute features     2     running  CPU    1-3 (3)  2s    epoch 3/3 (0s ago)
-  claude-b  vit-aug       vit augmentation study  9     waiting  -      -        2s    needs 1 GPU(s), 0 free
-```
+`tablely status`의 출력 예시는 [아래](#tablely-status-달성률-막대)에 있습니다.
 
 `tablely history` 예시:
 
@@ -367,30 +351,74 @@ machine: 4 core(s), GPUs [0], strict priority
 - 장부 디렉터리에는 `state.json`(현재 상태)과 `history.jsonl`(이벤트, 한 줄에 JSON 하나)이 있습니다. 파일 잠금(`flock`)으로 동시 접근을 막습니다.
 - 같은 머신의 같은 사용자끼리만 공유됩니다. 다른 머신과는 공유되지 않습니다.
 
-## 대시보드: 달성률과 재개하기 (`tablely ui`)
+## 달성률 보기와 재개하기 (CLI)
 
-```bash
-tablely ui                                  # http://127.0.0.1:8765 (GPU 서버라면: ssh -L 8765:127.0.0.1:8765 서버)
-tablely ui --resume-command "claude -p"     # 재개하기를 누르면 AI를 바로 실행
+Tablely는 CLI로 씁니다. 진행 상황은 `tablely status`로 보고, 이어서 하고 싶은 작업은 `tablely resume`으로 골라 AI에게 넘깁니다.
+
+### `tablely status`: 달성률 막대
+
+```
+machine  4 CPU core(s) [0-3] · 1 GPU(s) [0] · strict priority
+
+claude-b · ViT augmentation study   run 1bdb3462 · running 8s
+  █░░░░░░░░░░░░░░░░░░░   5%   2 running · 1 waiting
+    vit-mixup      █░░░░░░░░░   6%  running  GPU 0 · cores 0 (1) · prio 8        epoch 26/400, val acc 0.526 (0s ago)
+    vit-cutmix     ░░░░░░░░░░    -  waiting  prio 6                              needs 1 GPU(s), 0 free
+    feature-cache  █░░░░░░░░░  10%  running  CPU · cores 1-3 (3) · prio 2        epoch 39/400, val acc 0.539 (0s ago)
+
+recently finished (last 12h)
+  claude-a · ResNet-50 learning-rate sweep  █████████████░░░░░░░  67%  2 ok · 1 failed · ended 10m ago · run a1cd8cbc
+
+coding sessions
+  a1b2c3d4 · 작업 달성률을 보여주고 재개하기 버튼…  ████████████░░░░░░░░  60%  3/5 tasks · working · main
+      next: 대시보드와 재개하기 버튼
+
+notes
+  claude-a (10m ago): lr 1e-3 is best so far (val acc 0.90); next: retry 3e-3 with batch 64 to fit memory
+
+resume any of these with: tablely resume
 ```
 
-![Tablely 대시보드](docs/dashboard.png)
-
-- **에이전트 / 학습 작업**: 실행(run)마다 달성률과 작업별 진행 막대를 보여줍니다. 실행 중인 것과 최근(기본 72시간) 끝난 것이 모두 나오고, 3초마다 갱신됩니다.
+- 실행 중인 실행(run)은 작업마다 막대, 장치, 코어, 중요도, 진행 상황을 펼쳐서 보여줍니다. 최근(기본 12시간, `--hours`) 끝난 실행은 한 줄로 보여줍니다.
+- 저장소 안에서 실행하면(또는 `--repo`) 그 저장소의 코딩 에이전트 세션도 할 일 목록 달성률과 다음 할 일을 보여줍니다.
+- `tablely status --watch`(또는 `--watch 5`)는 Ctrl+C를 누를 때까지 화면을 계속 갱신합니다.
+- 터미널에서는 상태별로 색이 붙습니다. `NO_COLOR`를 설정하면 끕니다.
+- 한글처럼 두 칸을 차지하는 글자도 열을 맞춰 출력합니다.
 - **달성률 계산**:
   - 실행: (끝난 작업 수 + 실행 중인 작업들의 진행률 합) ÷ 전체 작업 수. 실패하거나 취소된 작업은 0으로 칩니다.
-  - 에이전트: 그 에이전트의 모든 작업을 같은 방식으로 합칩니다.
-- **코딩 세션**: 저장소 안에서 실행하면(또는 `--repo`) 그 저장소에서 일한 코딩 에이전트 세션도 보여줍니다. 달성률은 에이전트 자신의 할 일 목록에서 완료된 비율입니다 (Claude Code의 작업 목록을 hook이 자동으로 기록).
-- **재개하기**: 누르면 그 카드의 작업을 AI가 이어받을 수 있게 요약합니다.
-  - 요약 내용 (학습 작업): 목표, 달성률, 끝난 작업의 결과와 마지막 지표, 실패 원인과 로그 위치, 진행 중·대기 작업, 에이전트가 남긴 메모, 이어서 할 일
-  - 요약 내용 (코딩 세션): 할 일 목록(완료/진행 중/남음), 핸드오프, 사용자가 요청했던 것, 고친 파일, 브랜치
-  - 요약은 `$TABLELY_HOME/resume/`(기본 `~/.tablely/resume/`)에 저장되고 창에 표시됩니다. **복사**를 눌러 AI에게 붙여넣으면 됩니다.
-  - `--resume-command`(또는 `TABLELY_RESUME_COMMAND`)를 주면 요약을 들고 AI를 바로 실행합니다. 요약은 명령의 마지막 인자로 넘어갑니다. 파일 경로로 넘기려면 명령에 `{prompt_file}`을 쓰세요. AI의 출력은 요약 파일 옆 `.log`에 남습니다.
-- 버튼 없이 같은 요약을 터미널에서 만들 수도 있습니다: `tablely resume --agent claude-a`, `tablely resume --run <id>`, `tablely resume --session <id 앞자리> --repo .`. `--launch "claude -p"`를 붙이면 AI도 실행합니다.
-- **보안**:
-  - 기본으로 `127.0.0.1`에서만 열립니다.
-  - 재개하기 요청은 이 서버가 보여준 페이지에 들어 있는 토큰이 있어야 처리됩니다. 그래서 다른 웹페이지가 몰래 AI 실행을 요청할 수 없습니다.
-  - 다른 호스트 이름으로 들어온 요청도 거절합니다.
+  - 진행률은 학습 스크립트의 `client.progress`에서 옵니다 (위의 "학습 스크립트와 연동" 참고).
+  - 코딩 세션: 에이전트 자신의 할 일 목록에서 완료된 비율입니다. Claude Code의 작업 목록을 hook이 자동으로 기록합니다.
+
+### `tablely resume`: 골라서 AI에게 넘기기
+
+```
+$ tablely resume
+Resume which work?
+   1  run      1bdb3462  claude-b · ViT augmentation study             ██░░░░░░░░░░  16%  running
+   2  run      a1cd8cbc  claude-a · ResNet-50 learning-rate sweep      ████████░░░░  67%  ended 10m ago
+   3  session  a1b2c3d4  coding · 작업 달성률을 보여주고 재개하기 버…  ███████░░░░░  60%  3/5 tasks · working
+number [1-3, Enter = 1, q = quit]: 2
+# Resume: ResNet-50 learning-rate sweep (agent claude-a)
+...
+(saved to ~/.tablely/resume/20261010-064755-run-a1cd8cbc.md)
+Start `claude` with this summary? [Y/n]
+```
+
+1. 번호로 고릅니다. 바로 지정해도 됩니다: `tablely resume claude-a`(에이전트 이름), `tablely resume a1cd`(실행 id 앞자리), `tablely resume a1b2`(코딩 세션 id 앞자리).
+2. Tablely가 지금까지 한 일을 요약해서 보여주고 `~/.tablely/resume/`에 저장합니다.
+   - 학습 작업: 목표, 달성률, 끝난 작업의 결과와 마지막 지표, 실패 원인과 로그 위치, 진행 중·대기 작업, 에이전트가 남긴 메모, 이어서 할 일
+   - 코딩 세션: 할 일 목록(완료/진행 중/남음), 핸드오프, 사용자가 요청했던 것, 고친 파일, 브랜치
+3. 확인하면 같은 터미널에서 AI CLI가 그 요약을 첫 메시지로 받고 시작합니다. 코딩 세션이면 저장소 디렉터리에서 시작합니다.
+
+AI CLI 정하기:
+- 순서: `--ai "<명령>"` → `TABLELY_AI` 환경변수 → 설치돼 있으면 `claude`
+- 요약은 명령의 마지막 인자로 넘어갑니다. 파일 경로로 넘기려면 명령에 `{prompt_file}`을 쓰세요. 예: `--ai "my-ai --file {prompt_file}"`
+- AI CLI가 없으면 요약만 보여줍니다. 복사해서 붙여넣으면 됩니다.
+
+그 밖의 옵션:
+- `--yes`: 묻지 않고 바로 시작
+- `--print`: 요약만 출력 (예: `tablely resume claude-a --print | claude -p`)
+- 터미널이 아닌 곳(스크립트, 다른 에이전트)에서 대상 없이 부르면 고를 수 있는 목록만 출력합니다.
 
 ## 그 밖의 동작
 
@@ -409,14 +437,13 @@ tablely ui --resume-command "claude -p"     # 재개하기를 누르면 AI를 �
 | `tablely/planner.py` | 배분 로직 (순수 함수, I/O 없음 → 테스트/미리보기 용이) |
 | `tablely/runner.py` | 프로세스 실행, 감시, 재분배, 종료 처리 (공용 장부를 통해 다른 에이전트와 함께 계획) |
 | `tablely/ledger.py` | 머신 공용 장부: 실행/작업 등록, 죽은 실행 정리, 이벤트 기록 |
-| `tablely/board_view.py` | `tablely status` / `history` 출력 |
 | `tablely/affinity.py` | 프로세스 그룹 전체 코어 고정 (Linux) |
 | `tablely/config.py` | TOML/YAML/JSON 작업 파일 로딩 |
-| `tablely/cli.py` | `tablely resources / plan / run / status / history / note / brief / resume / ui` |
+| `tablely/cli.py` | `tablely resources / plan / run / status / history / brief / resume / note` |
 | `tablely/client.py` | 학습 스크립트용 선택적 헬퍼 (`device`, `progress`, `note`, `switch_requested`, `exit_for_switch` ...) |
 | `tablely/stream.py` | 큰 데이터 순차 업로드: 메모리 맵 → 고정 RAM 버퍼 → GPU, CPU는 L3 크기 블록 |
-| `tablely/progress.py` | 실행·에이전트 달성률 계산, 재개 요약(`resume_prompt`, `session_prompt`), AI에게 넘기기 |
-| `tablely/dashboard.py`, `tablely/_dashboard_page.py` | `tablely ui` 웹 서버와 페이지 (표준 라이브러리만 사용) |
+| `tablely/progress.py` | 실행·에이전트 달성률 계산, 재개 요약(`resume_prompt`, `session_prompt`), AI CLI 실행 |
+| `tablely/board_view.py` | `tablely status`(달성률 막대) / `history` / `brief` 출력 |
 | `tablely/worklog.py` | 코딩 에이전트 작업 기록 (hook 처리, 할 일 목록, 핸드오프, 브리핑) |
 | `tools/agent_log.py` | `tablely/worklog.py`를 설치 없이 실행하는 스크립트 (hooks가 사용, 아래 참고) |
 

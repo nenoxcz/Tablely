@@ -139,6 +139,11 @@ def collect_runs(data: Mapping[str, Any], events: Sequence[Mapping[str, Any]]) -
             j.detail = "runner gone" if entry.get("orphan") else None
         else:
             j.state, j.detail = "waiting", entry.get("wait_reason")
+    for view in runs.values():
+        if not view.live:
+            for j in view.jobs:
+                if j.state in ("waiting", "running"):  # the run ended before this job finished
+                    j.state = "cancelled"
     return sorted(runs.values(), key=lambda r: (not r.live, -(r.started or 0)))
 
 
@@ -181,7 +186,7 @@ def _job_line(j: JobView) -> str:
     if j.git:
         bits.append(f"code {j.git.get('commit')}{'+dirty' if j.git.get('dirty') else ''}"
                     + (f" on {j.git['branch']}" if j.git.get("branch") else ""))
-    if j.state == "failed" and j.log:
+    if j.state == "failed" and j.log and j.log not in (j.detail or ""):
         bits.append(f"log {j.log}")
     if j.switches:
         bits.append(f"moved between CPU/GPU {j.switches}x")
@@ -278,41 +283,27 @@ def _clock(event: Mapping[str, Any]) -> str:
     return stamp.replace("T", " ")[:16]
 
 
-def hand_to_ai(
-    prompt: str,
-    directory: Path,
-    label: str,
-    command: Optional[str] = None,
-    cwd: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Save a resume prompt and, if ``command`` is set, start an AI with it.
-
-    The prompt is always written to ``directory`` (so it can be pasted or
-    attached by hand). ``command`` is split like a shell line, e.g.
-    ``"claude -p"``: the prompt text is appended as the last argument, unless
-    the command contains ``{prompt_file}``, which is replaced by the saved
-    file's path. The AI runs detached; its output goes to a ``.log`` next to
-    the prompt.
-    """
+def save_prompt(prompt: str, directory: Path, label: str) -> Path:
+    """Keep a copy of a resume summary (``$TABLELY_HOME/resume/<time>-<label>.md``)."""
     directory.mkdir(parents=True, exist_ok=True)
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-")[:40] or "resume"
     path = directory / f"{time.strftime('%Y%m%d-%H%M%S')}-{safe}.md"
     path.write_text(prompt, encoding="utf-8")
-    result: Dict[str, Any] = {"prompt": prompt, "prompt_file": str(path), "launched": False}
-    if not command:
-        return result
+    return path
+
+
+def ai_argv(command: str, prompt: str, prompt_file: Path) -> List[str]:
+    """How to start the AI CLI with a summary: as its last argument (``claude "<summary>"``),
+    or as a file path where the command says ``{prompt_file}``."""
     parts = shlex.split(command)
     if any("{prompt_file}" in part for part in parts):
-        argv = [part.replace("{prompt_file}", str(path)) for part in parts]
-    else:
-        argv = parts + [prompt]
-    log = path.with_suffix(".log")
+        return [part.replace("{prompt_file}", str(prompt_file)) for part in parts]
+    return parts + [prompt]
+
+
+def run_ai(command: str, prompt: str, prompt_file: Path, cwd: Optional[str] = None) -> int:
+    """Start the AI CLI in this terminal with the summary and wait for it to finish."""
     try:
-        with open(log, "wb") as out:
-            proc = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=out,
-                                    stderr=subprocess.STDOUT, start_new_session=True)
+        return subprocess.call(ai_argv(command, prompt, prompt_file), cwd=cwd)
     except OSError as exc:
-        result["error"] = f"could not start {parts[0]!r}: {exc.strerror or exc}"
-        return result
-    result.update(launched=True, pid=proc.pid, log=str(log), command=command)
-    return result
+        raise RuntimeError(f"could not start {shlex.split(command)[0]!r}: {exc.strerror or exc}") from None

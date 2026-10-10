@@ -266,6 +266,17 @@ def todo_counts(entry: Dict[str, Any]) -> Tuple[int, int]:
     return sum(1 for t in todos if t.get("status") == "completed"), len(todos)
 
 
+def recent_sessions(start: str, hours: float) -> List[Dict[str, Any]]:
+    """Sessions of the repository at ``start`` that are open, or ended within ``hours``."""
+    if not git(Path(start), "rev-parse", "--show-toplevel"):
+        return []
+    return [
+        dict(s, status=shown_status(s))
+        for s in collect(repo_root(start))
+        if shown_status(s) != "ended" or age_seconds(s.get("updated_at")) <= hours * 3600
+    ]
+
+
 def find_session(start: str, prefix: str) -> Optional[Dict[str, Any]]:
     """The newest copy of the session whose id starts with ``prefix``, from any branch."""
     for session in collect(repo_root(start)):

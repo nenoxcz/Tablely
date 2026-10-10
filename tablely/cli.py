@@ -1,4 +1,4 @@
-"""Command line: ``tablely resources | plan | run | status | history | note | brief``."""
+"""Command line: ``tablely resources | plan | run | status | history | brief | resume | note``."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import dataclasses
 import json
 import os
 import re
+import shlex
+import shutil
 import signal
 import sys
 import time
@@ -18,7 +20,7 @@ from .board_view import render_brief, render_history, render_status
 from .config import Config, ConfigError, load_config
 from .ledger import Board, Ledger, default_agent, make_event
 from .planner import Policy, check_feasible, plan
-from .progress import collect_runs, hand_to_ai, resume_prompt, session_prompt
+from .progress import collect_runs, resume_prompt, run_ai, save_prompt, session_prompt
 from .resources import Inventory, build_inventory
 from .runner import Runner
 from .spec import format_priority
@@ -70,7 +72,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--task", help="what this run is for (default: 'task' in the job file)")
     p.set_defaults(func=_cmd_run)
 
-    p = sub.add_parser("status", parents=[shared], help="who is running what on this machine right now")
+    p = sub.add_parser("status", parents=[shared], help="progress of everyone's work on this machine")
+    p.add_argument("--watch", nargs="?", const=2.0, type=float, metavar="SECONDS",
+                   help="keep refreshing (every 2s, or SECONDS) until Ctrl+C")
+    p.add_argument("--hours", type=float, default=12.0, help="show runs that finished this recently (default 12)")
+    p.add_argument("--repo", default=".", help="also show coding sessions of this repository (default: .)")
     p.add_argument("--json", action="store_true", help="print the raw board as JSON")
     p.set_defaults(func=_cmd_status)
 
@@ -94,27 +100,19 @@ def _parser() -> argparse.ArgumentParser:
     p = sub.add_parser(
         "resume",
         parents=[shared],
-        help="summarize past work so an AI can continue it (print it, or start the AI with it)",
+        help="pick earlier work, summarize it and start an AI CLI with the summary",
     )
-    p.add_argument("--agent", help="resume this agent's runs (default: every agent in the window)")
-    p.add_argument("--run", help="resume one run (id from `tablely history`)")
-    p.add_argument("--session", help="resume a coding session from the work log (id prefix)")
-    p.add_argument("--repo", default=".", help="repository whose work log --session reads (default: .)")
-    p.add_argument("--hours", type=float, default=72.0, help="how far back to look (default 72)")
-    p.add_argument("--launch", metavar="COMMAND", default=None,
-                   help='start an AI with the summary, e.g. "claude -p" (default: $TABLELY_RESUME_COMMAND)')
-    p.add_argument("--print-only", action="store_true", help="never launch, even if TABLELY_RESUME_COMMAND is set")
+    p.add_argument("target", nargs="?",
+                   help="agent name, run id or coding-session id (a prefix is enough); omit to pick from a list")
+    p.add_argument("--repo", default=".", help="repository whose coding sessions can be resumed (default: .)")
+    p.add_argument("--hours", type=float, default=72.0, help="how far back to offer finished work (default 72)")
+    p.add_argument("--ai", metavar="COMMAND",
+                   help='AI CLI to start, e.g. "claude" (default: $TABLELY_AI, else claude if installed); '
+                        "{prompt_file} in it is replaced by the saved summary's path")
+    p.add_argument("--print", dest="print_only", action="store_true",
+                   help="only print the summary, e.g. to pipe it: tablely resume claude-a --print | claude -p")
+    p.add_argument("-y", "--yes", action="store_true", help="start the AI without asking")
     p.set_defaults(func=_cmd_resume)
-
-    p = sub.add_parser("ui", parents=[shared], help="web dashboard: completion rates and a Resume button per run")
-    p.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
-    p.add_argument("--port", type=int, default=8765, help="port (default 8765, 0 = any free port)")
-    p.add_argument("--repo", default=None,
-                   help="also show this repository's coding sessions (default: the current git repo, if any)")
-    p.add_argument("--hours", type=float, default=72.0, help="how far back finished work is shown (default 72)")
-    p.add_argument("--resume-command", default=None,
-                   help='start an AI with the summary on Resume, e.g. "claude -p" (default: $TABLELY_RESUME_COMMAND)')
-    p.set_defaults(func=_cmd_ui)
 
     p = sub.add_parser("note", parents=[shared], help="record what an agent is working on or what comes next")
     p.add_argument("text", nargs="+")
@@ -222,12 +220,29 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
+    from .worklog import recent_sessions
+
     ledger = Ledger(args.home)
-    data = ledger.snapshot()
     if args.json:
-        print(json.dumps(data, indent=2, ensure_ascii=False))
-    else:
-        print(render_status(data, events=ledger.history()))
+        print(json.dumps(ledger.snapshot(), indent=2, ensure_ascii=False))
+        return 0
+    color = _fmt.use_color()
+
+    def frame() -> str:
+        return render_status(ledger.snapshot(), events=ledger.history(), hours=args.hours, color=color,
+                             sessions=recent_sessions(args.repo, args.hours))
+
+    if args.watch is None:
+        print(frame())
+        return 0
+    try:
+        while True:
+            sys.stdout.write("\033[H\033[2J" + frame()
+                             + f"\n\nrefreshing every {args.watch:g}s · Ctrl+C to stop\n")
+            sys.stdout.flush()
+            time.sleep(max(args.watch, 0.2))
+    except KeyboardInterrupt:
+        print()
     return 0
 
 
@@ -253,66 +268,127 @@ def _cmd_brief(args: argparse.Namespace) -> int:
     return 0
 
 
+@dataclasses.dataclass
+class _Choice:
+    kind: str  # "run", "agent" or "session"
+    ident: str
+    line: str  # how it is listed in the picker
+
+
 def _cmd_resume(args: argparse.Namespace) -> int:
+    from . import worklog
+
     ledger = Ledger(args.home)
-    if args.session:
-        from .worklog import find_session
-
-        session = find_session(args.repo, args.session)
-        if session is None:
-            raise ConfigError(f"no coding session starting with {args.session!r} in {args.repo}")
-        prompt, label, cwd = session_prompt(session), f"session-{session['session'][:8]}", args.repo
+    runs, sessions = _resumable(ledger, args.repo, args.hours)
+    if args.target:
+        choice = _match_target(args.target, runs, args.repo)
     else:
-        prompt, label = _training_prompt(ledger, args.agent, args.run, args.hours)
-        cwd = None
-    command = None if args.print_only else (args.launch or os.environ.get("TABLELY_RESUME_COMMAND"))
-    result = hand_to_ai(prompt, ledger.home / "resume", label, command=command, cwd=cwd)
+        choices = [_run_choice(r) for r in runs] + [_session_choice(s) for s in sessions]
+        if not choices:
+            raise ConfigError(f"nothing to resume: no runs in the last {args.hours:g}h and no coding sessions here")
+        if not _interactive():
+            print("\n".join(c.line for c in choices))
+            raise ConfigError("name one to resume: tablely resume <id>")
+        choice = _pick(choices)
+        if choice is None:
+            return 0
+
+    color = _fmt.use_color()
+    if choice.kind == "session":
+        session = worklog.find_session(args.repo, choice.ident)
+        prompt, label, cwd = session_prompt(session), f"session-{choice.ident[:8]}", str(worklog.repo_root(args.repo))
+    else:
+        picked = [r for r in runs if (r.run if choice.kind == "run" else r.agent) == choice.ident]
+        if choice.kind == "run" and not picked:  # an older run, outside the window
+            picked = [r for r in collect_runs(ledger.snapshot(), ledger.history()) if r.run == choice.ident]
+        since = time.time() - args.hours * 3600
+        notes = [e for e in ledger.history(agent=picked[0].agent) if e.get("event") == "note"
+                 and e.get("t", 0) >= since][-10:][::-1]
+        prompt, label, cwd = resume_prompt(picked, notes, agent=picked[0].agent), f"{choice.kind}-{choice.ident}", None
+    path = save_prompt(prompt, ledger.home / "resume", label)
+
+    if args.print_only:
+        print(prompt)
+        return 0
     print(prompt)
-    print(f"\n(saved to {result['prompt_file']})", file=sys.stderr)
-    if result.get("launched"):
-        print(f"started `{command}` with it (pid {result['pid']}, output in {result['log']})", file=sys.stderr)
-    elif result.get("error"):
-        print(f"tablely: {result['error']}", file=sys.stderr)
-        return 1
-    return 0
-
-
-def _training_prompt(ledger: Ledger, agent: Optional[str], run: Optional[str], hours: float):
-    since = time.time() - hours * 3600
-    events = ledger.history()
-    runs = [
-        r for r in collect_runs(ledger.snapshot(), events)
-        if (run is None or r.run.startswith(run)) and (agent is None or r.agent == agent)
-        and (run is not None or r.live or (r.ended or 0) >= since)
-    ]
-    if not runs:
-        raise ConfigError("nothing to resume: no matching runs" + (f" in the last {hours:g}h" if not run else ""))
-    agents = {r.agent for r in runs}
-    notes = [e for e in events if e.get("event") == "note" and e.get("agent") in agents
-             and e.get("t", 0) >= since][-10:][::-1]
-    who = agent or (runs[0].agent if len(agents) == 1 else ", ".join(sorted(agents)))
-    label = f"run-{run}" if run else f"agent-{who}"
-    return resume_prompt(runs, notes, agent=who), label
-
-
-def _cmd_ui(args: argparse.Namespace) -> int:
-    from .dashboard import Dashboard, serve
-    from .worklog import git
-
-    repo = args.repo
-    if repo is None and git(Path.cwd(), "rev-parse", "--show-toplevel"):
-        repo = str(Path.cwd())
-    dashboard = Dashboard(
-        Ledger(args.home),
-        repo=repo,
-        hours=args.hours,
-        resume_command=args.resume_command or os.environ.get("TABLELY_RESUME_COMMAND"),
-    )
+    print(_fmt.paint(f"\n(saved to {path})", "dim", color))
+    command = args.ai or os.environ.get("TABLELY_AI") or ("claude" if shutil.which("claude") else None)
+    if command is None:
+        print("No AI CLI found. Paste the summary above into your AI, or set TABLELY_AI / pass --ai \"<command>\".")
+        return 0
+    if not args.yes:
+        if not _interactive():
+            print(f"To hand it over: tablely resume {choice.ident} --ai {shlex.quote(command)} --yes")
+            return 0
+        answer = input(f"Start `{command}` with this summary? [Y/n] ").strip().lower()
+        if answer not in ("", "y", "yes"):
+            return 0
     try:
-        serve(dashboard, args.host, args.port)
-    except OSError as exc:
-        raise ConfigError(f"cannot listen on {args.host}:{args.port}: {exc.strerror or exc}") from None
-    return 0
+        return run_ai(command, prompt, path, cwd=cwd)
+    except RuntimeError as exc:
+        raise ConfigError(str(exc)) from None
+
+
+def _resumable(ledger: Ledger, repo: str, hours: float):
+    """Runs (live first) and coding sessions that can be resumed."""
+    from .worklog import recent_sessions
+
+    since = time.time() - hours * 3600
+    runs = [r for r in collect_runs(ledger.snapshot(), ledger.history()) if r.live or (r.ended or 0) >= since]
+    return runs, recent_sessions(repo, hours)
+
+
+def _run_choice(run) -> _Choice:
+    state = "running" if run.live else f"ended {_fmt.duration(time.time() - run.ended)} ago"
+    head = _fmt.pad(_fmt.clip(f"{run.agent} · {run.task or '-'}", 44), 44)
+    return _Choice("run", run.run, f"run      {run.run}  {head}  {_fmt.bar(run.achievement, 12)} "
+                                   f"{_fmt.percent(run.achievement)}  {state}")
+
+
+def _session_choice(session) -> _Choice:
+    todos = session.get("todos") or []
+    done = sum(1 for t in todos if t.get("status") == "completed")
+    fraction = done / len(todos) if todos else None
+    head = _fmt.pad(_fmt.clip(f"coding · {session.get('task') or '-'}", 44), 44)
+    tasks = f"{done}/{len(todos)} tasks · " if todos else ""
+    return _Choice("session", session["session"],
+                   f"session  {session['session'][:8]}  {head}  {_fmt.bar(fraction, 12)} "
+                   f"{_fmt.percent(fraction)}  {tasks}{session.get('status', '?')}")
+
+
+def _match_target(target: str, runs, repo: str) -> _Choice:
+    from .worklog import find_session
+
+    if any(r.agent == target for r in runs):
+        return _Choice("agent", target, target)
+    matches = sorted({r.run for r in runs if r.run.startswith(target)})
+    if len(matches) > 1:
+        raise ConfigError(f"{target!r} matches several runs: {', '.join(matches)}")
+    if matches:
+        return _Choice("run", matches[0], matches[0])
+    session = find_session(repo, target)
+    if session is not None:
+        return _Choice("session", session["session"], session["session"])
+    raise ConfigError(f"no agent, run or coding session matches {target!r} (see: tablely resume)")
+
+
+def _interactive() -> bool:
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def _pick(choices: List[_Choice]) -> Optional[_Choice]:
+    print("Resume which work?")
+    for i, choice in enumerate(choices, start=1):
+        print(f"  {i:>2}  {choice.line}")
+    while True:
+        answer = input(f"number [1-{len(choices)}, Enter = 1, q = quit]: ").strip().lower()
+        if answer in ("q", "quit"):
+            return None
+        if answer == "":
+            return choices[0]
+        if answer.isdigit() and 1 <= int(answer) <= len(choices):
+            return choices[int(answer) - 1]
+        print("  not a number from the list")
 
 
 def _cmd_note(args: argparse.Namespace) -> int:

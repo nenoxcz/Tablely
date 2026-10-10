@@ -246,7 +246,7 @@ def test_resume_prompt_for_a_coding_session(tmp_path, isolated_tablely_home):
     hook(repo, "PostToolUse", sid, tool_name="Edit", tool_input={"file_path": str(repo / "ui.py")})
     tool(repo, "handoff", "progress done; next: the resume button", env={"CLAUDE_CODE_SESSION_ID": sid})
 
-    result = subprocess.run([sys.executable, "-m", "tablely", "resume", "--session", "h8h8", "--repo", str(repo)],
+    result = subprocess.run([sys.executable, "-m", "tablely", "resume", "h8h8", "--repo", str(repo), "--print"],
                             capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent)
     assert result.returncode == 0, result.stderr
     prompt = result.stdout
@@ -254,4 +254,3 @@ def test_resume_prompt_for_a_coding_session(tmp_path, isolated_tablely_home):
     assert "- [x] progress %" in prompt and "- [ ] resume button" in prompt
     assert "next: the resume button" in prompt and "show progress and a resume button" in prompt
     assert "ui.py" in prompt and "branch `main`" in prompt
-    assert "saved to" in result.stderr

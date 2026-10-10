@@ -3,10 +3,11 @@ import json
 import os
 import sys
 import textwrap
+import time
 
 from tablely.cli import main
 from tablely.ledger import Ledger, parse_fraction
-from tablely.progress import collect_runs, hand_to_ai, resume_prompt
+from tablely.progress import ai_argv, collect_runs, resume_prompt, save_prompt
 from tablely.resources import Inventory, detect_cpus
 from tablely.runner import Runner
 from tablely.spec import JobSpec
@@ -77,58 +78,35 @@ def test_running_jobs_count_by_reported_fraction():
     assert "- [waiting] j2: needs 1 GPU(s)" in prompt
 
 
-def test_status_shows_completion(tmp_path, capsys, isolated_tablely_home):
+def test_status_shows_progress_bars(tmp_path, capsys, isolated_tablely_home):
     ledger = Ledger(isolated_tablely_home)
+    run_batch(tmp_path, ledger)  # finished: 2 ok, 1 failed
     with ledger.locked() as board:
-        board.add_run("r1", {"agent": "claude-z", "task": "t", "pid": os.getpid(), "started_at": 1.0,
-                             "jobs": ["j1"]})
+        board.add_run("r1", {"agent": "claude-z", "task": "학습률 탐색", "pid": os.getpid(), "started_at": time.time(),
+                             "jobs": ["j1", "j2"]})
         board.put_job("r1.j1", {
-            "run": "r1", "agent": "claude-z", "name": "j1", "task": "t", "priority": 1, "device": "cpu",
+            "run": "r1", "agent": "claude-z", "name": "j1", "task": "학습률 탐색", "priority": 1, "device": "cpu",
             "gpus": 0, "cpus": 1, "max_cpus": None, "state": "running", "seq": board.next_seq(),
             "allocation": {"device": "cpu", "gpus": [], "cpus": [0]}, "pid": os.getpid(), "started_at": 1.0,
             "progress": "epoch 2/5", "progress_frac": 0.4, "progress_at": 1.0, "orphan": False,
         })
-    assert main(["status"]) == 0
+        board.put_job("r1.j2", {
+            "run": "r1", "agent": "claude-z", "name": "j2", "task": None, "priority": 3, "device": "gpu",
+            "gpus": 1, "cpus": 1, "max_cpus": None, "state": "pending", "seq": board.next_seq(),
+            "wait_reason": "needs 1 GPU(s), 0 free", "orphan": False,
+        })
+    assert main(["status", "--repo", str(tmp_path)]) == 0
     out = capsys.readouterr().out
-    assert "DONE" in out and "40%" in out
+    assert "claude-z · 학습률 탐색" in out
+    assert "████░░░░░░░░░░░░░░░░  20%" in out  # run: (0.4 + 0) / 2 of a 20-cell bar
+    assert "████░░░░░░  40%  running  CPU · cores 0 (1) · prio 1" in out and "epoch 2/5" in out
+    assert "░░░░░░░░░░    -  waiting  prio 3" in out and "needs 1 GPU(s), 0 free" in out
+    assert "recently finished" in out and "claude-a · lr sweep" in out and "2 ok · 1 failed" in out
+    assert "resume any of these with: tablely resume" in out
 
 
-def test_resume_command_summarizes_and_can_launch_an_ai(tmp_path, capsys, isolated_tablely_home):
-    ledger = Ledger(isolated_tablely_home)
-    run_batch(tmp_path, ledger)
-    assert main(["note", "--agent", "claude-a", "next: rerun c with a smaller lr"]) == 0
-    capsys.readouterr()
-
-    assert main(["resume", "--agent", "claude-a", "--print-only"]) == 0
-    captured = capsys.readouterr()
-    prompt = captured.out
-    assert prompt.startswith("# Resume: lr sweep (agent claude-a)")
-    assert "Overall: 67% done. 2 of 3 jobs finished OK, 1 failed" in prompt
-    assert "- [failed] c" in prompt and "c.log" in prompt
-    assert "next: rerun c with a smaller lr" in prompt
-    saved = captured.err.split("saved to ")[1].split(")")[0]
-    assert open(saved).read() == prompt.rstrip("\n")
-
-    got = tmp_path / "ai-got.json"
-    fake_ai = f"{sys.executable} -c \"import json,sys; json.dump(sys.argv[1:], open({str(got)!r}, 'w'))\""
-    assert main(["resume", "--agent", "claude-a", "--launch", fake_ai]) == 0
-    assert "started" in capsys.readouterr().err
-    for _ in range(200):
-        if got.exists():
-            break
-        __import__("time").sleep(0.02)
-    (handed,) = json.loads(got.read_text())
-    assert handed.startswith("# Resume: lr sweep")
-
-
-def test_prompt_file_placeholder(tmp_path):
-    out = tmp_path / "seen.txt"
-    result = hand_to_ai("hello", tmp_path / "resume", "x y/z",
-                        command=f"{sys.executable} -c \"import sys,shutil; shutil.copy(sys.argv[1], {str(out)!r})\" {{prompt_file}}")
-    assert result["launched"] and result["prompt_file"].endswith("-x-y-z.md")
-    for _ in range(200):
-        if out.exists():
-            break
-        __import__("time").sleep(0.02)
-    assert out.read_text() == "hello"
-    assert hand_to_ai("hi", tmp_path / "r", "l", command="definitely-not-an-ai-xyz")["error"]
+def test_summary_files_and_ai_arguments(tmp_path):
+    path = save_prompt("hello", tmp_path / "resume", "run x/y")
+    assert path.read_text() == "hello" and path.name.endswith("-run-x-y.md")
+    assert ai_argv("claude", "hello", path) == ["claude", "hello"]
+    assert ai_argv("my-ai --file {prompt_file} -q", "hello", path) == ["my-ai", "--file", str(path), "-q"]

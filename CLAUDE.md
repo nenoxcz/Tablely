@@ -22,7 +22,7 @@
 - 설치와 테스트: `pip install -e '.[test,yaml]' && pytest` (Python 3.10+, 외부 의존성 없음)
 - `tablely/planner.py`는 순수 함수입니다. 배분 규칙을 바꾸면 `tests/test_planner.py`부터 고치세요.
 - 작업 기록 코드는 `tablely/worklog.py`에 있습니다. `tools/agent_log.py`는 hooks가 설치 없이 부르기 위한 얇은 스크립트입니다.
-- 달성률과 재개 요약은 `tablely/progress.py`, 대시보드는 `tablely/dashboard.py`(서버)와 `tablely/_dashboard_page.py`(페이지)에 있습니다. 페이지를 고치면 `tablely ui`를 다시 띄워서 브라우저로 확인하세요. 서버는 시작할 때 페이지를 읽습니다.
+- Tablely는 CLI 도구입니다. 웹 UI는 두지 않습니다. 달성률과 재개 요약은 `tablely/progress.py`에 있고, 터미널 출력(`status`의 막대 등)은 `tablely/board_view.py`, 재개 고르기는 `cli.py`의 `_cmd_resume`에 있습니다.
 - 여러 에이전트 조율은 `tablely/ledger.py`(공용 장부)와 `tablely/runner.py`의 `_tick`이 담당합니다. CPU↔GPU 전환 요청은 `runner.py`의 `_switch_wishes`가 정합니다.
 - `tablely/stream.py`(순차 업로드)의 CUDA 경로(`CudaBackend`, 다중 GPU `map_chunks`)는 GPU 없는 환경에서는 실행되지 않습니다. 파이프라인 로직은 `tests/test_stream.py`의 가짜 backend로 검증합니다. GPU 서버에서 작업하게 되면 이 경로부터 실제로 돌려 보세요.
 - 테스트는 `tests/conftest.py`가 `TABLELY_HOME`을 임시 디렉터리로 바꾸므로 실제 `~/.tablely`를 건드리지 않습니다.
