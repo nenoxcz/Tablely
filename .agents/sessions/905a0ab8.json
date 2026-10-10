@@ -3,10 +3,10 @@
   "agent": "claude",
   "branch": "nenoxcz/kind-maxwell-onq8cl",
   "status": "working",
-  "task": "CLI-only: drop web dashboard; progress bars in tablely status, interactive tablely resume that starts the AI CLI",
+  "task": "MCP server (tablely mcp): status/brief/resume/history/note for Claude and ChatGPT apps",
   "task_source": "agent",
   "started_at": "2026-10-08T05:38:03Z",
-  "updated_at": "2026-10-10T06:51:29Z",
+  "updated_at": "2026-10-10T07:04:54Z",
   "prompts": [
     {
       "at": "2026-10-08T07:05:34Z",
@@ -23,22 +23,27 @@
     {
       "at": "2026-10-10T06:44:00Z",
       "text": "그 CLI로 사용되는 느낌이야. UI가 그렇게 있는건 아니고"
+    },
+    {
+      "at": "2026-10-10T06:56:51Z",
+      "text": "지금 이렇게 claude app 이나 GPT app으로 사용해도 참조가 가능하게 하는 그런걸로"
     }
   ],
   "files": [
     "tablely/stream.py",
     "tablely/progress.py",
     "tablely/dashboard.py",
-    "tablely/_dashboard_page.py"
+    "tablely/_dashboard_page.py",
+    "tablely/mcp.py"
   ],
   "handoff": {
-    "at": "2026-10-10T06:51:29Z",
-    "text": "끝낸 것: 웹 대시보드 제거(Tablely는 CLI 전용). tablely status를 달성률 막대 화면으로(실행별/작업별 막대, 최근 끝난 실행, 코딩 세션 할 일 달성률, 메모, --watch, 한글 폭 정렬). tablely resume: 번호로 고르거나 에이전트/실행/세션 id로 지정 -> 요약 저장 -> 확인 후 AI CLI(--ai, TABLELY_AI, 없으면 claude)를 같은 터미널에서 실행, --print/--yes. 다음: 실제 GPU 서버에서 stream CUDA 경로 검증, 실패 작업 재실행 명령, 데몬/tablely submit. 주의: 웹 UI는 커밋 e2d8266에 남아 있음, 다시 넣지 말 것(사용자 의도: CLI).",
-    "head": "e2d8266"
+    "at": "2026-10-10T07:04:54Z",
+    "text": "끝낸 것: tablely mcp (MCP 서버). 도구 tablely_status/resume/brief/history/note, 리소스 tablely://status·brief, 프롬프트 resume. stdio(Claude Desktop/Code, ssh gpu-server tablely mcp)와 --http(토큰 경로 /mcp/<token> 또는 Bearer, ~/.tablely/mcp-token). 핸드셰이크 방식(2024-11-05~2025-11-25), 공식 MCP Python SDK 2.3.0 클라이언트로 stdio·HTTP 확인. CLI와 공유 로직은 tablely/handoff.py. 다음: 실제 Claude 앱/ChatGPT 앱에 터널로 연결해 확인(이 환경에선 못 함), GPU 서버 stream 검증, 실패 작업 재실행. 주의: stdio 모드에서 stdout 출력 금지.",
+    "head": "da48402"
   },
   "last_reply": {
-    "at": "2026-10-10T06:42:37Z",
-    "text": "진행 중인 작업을 달성률로 보여주는 대시보드와, 누르면 한 일을 요약해서 AI에게 넘기는 **재개하기** 버튼을 만들어 푸시했습니다. 방금 보낸 이미지가 실제 화면이고, 데이터는 데모용입니다. 헤드리스 Chromium에서 열어 재개하기 버튼까지 눌러 확인했고, 테스트 108개가 모두 통과합니다. **대시보드: `tablely ui`** - 실행하면 `http://127.0.0.1:8765`에 열리고 3초마다 갱신됩니다. GPU 서버라면 `ssh -L 8765:127.0.0.1:8765 서버`로 터널을 열어 보면 됩니다. - 화면에는 에이전트별, 실행별, 작업별 달성률 막대가 나옵니다. 저장소 안에서 띄우면 코딩 세션도 함께 보입니다. **달성률 계산 방식** - **학습 작업**: - 실행 하나의 달성률 = (끝난 작업 + 실행 중 작업의 진행률) ÷ 전체 작업 수입니다. - 진행률은 스크립트가 `client.progress(\"epoch 3/10\")`처럼 보고하면 자동으로 30%로 읽습니다. `done=3, total=10`처럼 숫자로 줘도 됩니다. - 실패하거나 취소된 작업은 0%로 칩니다. - **코딩 세션**: 에이전트가 쓰는 할 일 목록의 완료 비율…"
+    "at": "2026-10-10T06:51:54Z",
+    "text": "CLI 도구로 맞춰 바꿨습니다. 웹 대시보드(`tablely ui`)는 지웠고, 진행 상황 보기와 재개하기를 둘 다 터미널 명령으로 옮겨서 푸시했습니다. 테스트 111개가 통과합니다. **`tablely status`: 달성률 막대** ``` claude-b · ViT augmentation study run 1bdb3462 · running 8s █░░░░░░░░░░░░░░░░░░░ 5% 2 running · 1 waiting vit-mixup █░░░░░░░░░ 6% running GPU 0 · cores 0 (1) · prio 8 epoch 26/400 ... vit-cutmix ░░░░░░░░░░ - waiting prio 6 needs 1 GPU(s), 0 free recently finished (last 12h) claude-a · ResNet-50 learning-rate sweep █████████████░░░░░░░ 67% 2 ok · 1 failed coding sessions a1b2c3d4 · 작업 달성률을 보여주고… ████████████░░░░░░░░ 60% 3/5 tasks · working next: 대시보드와 재개하기 버튼 …"
   },
   "start_commit": "e18c080",
   "todos": [
@@ -55,6 +60,21 @@
     {
       "id": "8",
       "subject": "Tests, docs, handoff, commit",
+      "status": "completed"
+    },
+    {
+      "id": "9",
+      "subject": "Share status/resume logic between CLI and MCP",
+      "status": "completed"
+    },
+    {
+      "id": "10",
+      "subject": "MCP server: stdio + streamable HTTP with token",
+      "status": "completed"
+    },
+    {
+      "id": "11",
+      "subject": "Verify with official MCP SDK client, tests, docs, commit",
       "status": "in_progress"
     }
   ]

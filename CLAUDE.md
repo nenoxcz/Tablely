@@ -22,6 +22,7 @@
 - 설치와 테스트: `pip install -e '.[test,yaml]' && pytest` (Python 3.10+, 외부 의존성 없음)
 - `tablely/planner.py`는 순수 함수입니다. 배분 규칙을 바꾸면 `tests/test_planner.py`부터 고치세요.
 - 작업 기록 코드는 `tablely/worklog.py`에 있습니다. `tools/agent_log.py`는 hooks가 설치 없이 부르기 위한 얇은 스크립트입니다.
+- AI 앱 연동은 MCP 서버 `tablely/mcp.py`(`tablely mcp`)로 합니다. stdio 모드에서는 stdout이 프로토콜 전용이므로, MCP가 부르는 코드(`handoff.py`, `board_view.py`, `worklog.py` 등)에서 stdout에 출력하지 마세요. 프로토콜을 고치면 공식 MCP Python SDK 클라이언트로 stdio와 HTTP 둘 다 붙어 보세요.
 - Tablely는 CLI 도구입니다. 웹 UI는 두지 않습니다. 달성률과 재개 요약은 `tablely/progress.py`에 있고, 터미널 출력(`status`의 막대 등)은 `tablely/board_view.py`, 재개 고르기는 `cli.py`의 `_cmd_resume`에 있습니다.
 - 여러 에이전트 조율은 `tablely/ledger.py`(공용 장부)와 `tablely/runner.py`의 `_tick`이 담당합니다. CPU↔GPU 전환 요청은 `runner.py`의 `_switch_wishes`가 정합니다.
 - `tablely/stream.py`(순차 업로드)의 CUDA 경로(`CudaBackend`, 다중 GPU `map_chunks`)는 GPU 없는 환경에서는 실행되지 않습니다. 파이프라인 로직은 `tests/test_stream.py`의 가짜 backend로 검증합니다. GPU 서버에서 작업하게 되면 이 경로부터 실제로 돌려 보세요.

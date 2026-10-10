@@ -1,4 +1,4 @@
-"""Command line: ``tablely resources | plan | run | status | history | brief | resume | note``."""
+"""Command line: ``tablely resources | plan | run | status | history | brief | resume | mcp | note``."""
 
 from __future__ import annotations
 
@@ -15,12 +15,12 @@ import time
 from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
-from . import __version__, _fmt
-from .board_view import render_brief, render_history, render_status
+from . import __version__, _fmt, handoff
+from .board_view import render_brief, render_history
 from .config import Config, ConfigError, load_config
 from .ledger import Board, Ledger, default_agent, make_event
 from .planner import Policy, check_feasible, plan
-from .progress import collect_runs, resume_prompt, run_ai, save_prompt, session_prompt
+from .progress import run_ai, save_prompt
 from .resources import Inventory, build_inventory
 from .runner import Runner
 from .spec import format_priority
@@ -113,6 +113,20 @@ def _parser() -> argparse.ArgumentParser:
                    help="only print the summary, e.g. to pipe it: tablely resume claude-a --print | claude -p")
     p.add_argument("-y", "--yes", action="store_true", help="start the AI without asking")
     p.set_defaults(func=_cmd_resume)
+
+    p = sub.add_parser(
+        "mcp",
+        parents=[shared],
+        help="let AI apps refer to Tablely over MCP (stdio for Claude Desktop/Code; --http for remote connectors)",
+    )
+    p.add_argument("--http", action="store_true",
+                   help="serve HTTP instead of stdio, for the Claude or ChatGPT app through an HTTPS tunnel")
+    p.add_argument("--host", default="127.0.0.1", help="--http address (default 127.0.0.1)")
+    p.add_argument("--port", type=int, default=8766, help="--http port (default 8766)")
+    p.add_argument("--token", help="--http secret (default: $TABLELY_MCP_TOKEN, else kept in $TABLELY_HOME/mcp-token)")
+    p.add_argument("--repo", default=None,
+                   help="repository whose coding sessions to include (default: the current directory if it is one)")
+    p.set_defaults(func=_cmd_mcp)
 
     p = sub.add_parser("note", parents=[shared], help="record what an agent is working on or what comes next")
     p.add_argument("text", nargs="+")
@@ -220,8 +234,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
-    from .worklog import recent_sessions
-
     ledger = Ledger(args.home)
     if args.json:
         print(json.dumps(ledger.snapshot(), indent=2, ensure_ascii=False))
@@ -229,8 +241,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
     color = _fmt.use_color()
 
     def frame() -> str:
-        return render_status(ledger.snapshot(), events=ledger.history(), hours=args.hours, color=color,
-                             sessions=recent_sessions(args.repo, args.hours))
+        return handoff.status_text(ledger, args.repo, args.hours, color=color)
 
     if args.watch is None:
         print(frame())
@@ -268,50 +279,32 @@ def _cmd_brief(args: argparse.Namespace) -> int:
     return 0
 
 
-@dataclasses.dataclass
-class _Choice:
-    kind: str  # "run", "agent" or "session"
-    ident: str
-    line: str  # how it is listed in the picker
-
-
 def _cmd_resume(args: argparse.Namespace) -> int:
-    from . import worklog
-
     ledger = Ledger(args.home)
-    runs, sessions = _resumable(ledger, args.repo, args.hours)
-    if args.target:
-        choice = _match_target(args.target, runs, args.repo)
-    else:
-        choices = [_run_choice(r) for r in runs] + [_session_choice(s) for s in sessions]
-        if not choices:
-            raise ConfigError(f"nothing to resume: no runs in the last {args.hours:g}h and no coding sessions here")
-        if not _interactive():
-            print("\n".join(c.line for c in choices))
-            raise ConfigError("name one to resume: tablely resume <id>")
-        choice = _pick(choices)
-        if choice is None:
-            return 0
-
-    color = _fmt.use_color()
-    if choice.kind == "session":
-        session = worklog.find_session(args.repo, choice.ident)
-        prompt, label, cwd = session_prompt(session), f"session-{choice.ident[:8]}", str(worklog.repo_root(args.repo))
-    else:
-        picked = [r for r in runs if (r.run if choice.kind == "run" else r.agent) == choice.ident]
-        if choice.kind == "run" and not picked:  # an older run, outside the window
-            picked = [r for r in collect_runs(ledger.snapshot(), ledger.history()) if r.run == choice.ident]
-        since = time.time() - args.hours * 3600
-        notes = [e for e in ledger.history(agent=picked[0].agent) if e.get("event") == "note"
-                 and e.get("t", 0) >= since][-10:][::-1]
-        prompt, label, cwd = resume_prompt(picked, notes, agent=picked[0].agent), f"{choice.kind}-{choice.ident}", None
+    runs, sessions = handoff.resumable(ledger, args.repo, args.hours)
+    try:
+        if args.target:
+            choice = handoff.match(args.target, runs, args.repo)
+        else:
+            options = handoff.choices(runs, sessions)
+            if not options:
+                raise ConfigError(f"nothing to resume: no runs in the last {args.hours:g}h and no coding sessions here")
+            if not _interactive():
+                print("\n".join(c.line for c in options))
+                raise ConfigError("name one to resume: tablely resume <id>")
+            choice = _pick(options)
+            if choice is None:
+                return 0
+        prompt, label, cwd = handoff.summarize(ledger, choice, runs, args.repo, args.hours)
+    except LookupError as exc:
+        raise ConfigError(f"{exc} (see: tablely resume)") from None
     path = save_prompt(prompt, ledger.home / "resume", label)
 
     if args.print_only:
         print(prompt)
         return 0
     print(prompt)
-    print(_fmt.paint(f"\n(saved to {path})", "dim", color))
+    print(_fmt.paint(f"\n(saved to {path})", "dim", _fmt.use_color()))
     command = args.ai or os.environ.get("TABLELY_AI") or ("claude" if shutil.which("claude") else None)
     if command is None:
         print("No AI CLI found. Paste the summary above into your AI, or set TABLELY_AI / pass --ai \"<command>\".")
@@ -329,54 +322,11 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         raise ConfigError(str(exc)) from None
 
 
-def _resumable(ledger: Ledger, repo: str, hours: float):
-    """Runs (live first) and coding sessions that can be resumed."""
-    from .worklog import recent_sessions
-
-    since = time.time() - hours * 3600
-    runs = [r for r in collect_runs(ledger.snapshot(), ledger.history()) if r.live or (r.ended or 0) >= since]
-    return runs, recent_sessions(repo, hours)
-
-
-def _run_choice(run) -> _Choice:
-    state = "running" if run.live else f"ended {_fmt.duration(time.time() - run.ended)} ago"
-    head = _fmt.pad(_fmt.clip(f"{run.agent} · {run.task or '-'}", 44), 44)
-    return _Choice("run", run.run, f"run      {run.run}  {head}  {_fmt.bar(run.achievement, 12)} "
-                                   f"{_fmt.percent(run.achievement)}  {state}")
-
-
-def _session_choice(session) -> _Choice:
-    todos = session.get("todos") or []
-    done = sum(1 for t in todos if t.get("status") == "completed")
-    fraction = done / len(todos) if todos else None
-    head = _fmt.pad(_fmt.clip(f"coding · {session.get('task') or '-'}", 44), 44)
-    tasks = f"{done}/{len(todos)} tasks · " if todos else ""
-    return _Choice("session", session["session"],
-                   f"session  {session['session'][:8]}  {head}  {_fmt.bar(fraction, 12)} "
-                   f"{_fmt.percent(fraction)}  {tasks}{session.get('status', '?')}")
-
-
-def _match_target(target: str, runs, repo: str) -> _Choice:
-    from .worklog import find_session
-
-    if any(r.agent == target for r in runs):
-        return _Choice("agent", target, target)
-    matches = sorted({r.run for r in runs if r.run.startswith(target)})
-    if len(matches) > 1:
-        raise ConfigError(f"{target!r} matches several runs: {', '.join(matches)}")
-    if matches:
-        return _Choice("run", matches[0], matches[0])
-    session = find_session(repo, target)
-    if session is not None:
-        return _Choice("session", session["session"], session["session"])
-    raise ConfigError(f"no agent, run or coding session matches {target!r} (see: tablely resume)")
-
-
 def _interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def _pick(choices: List[_Choice]) -> Optional[_Choice]:
+def _pick(choices: List[handoff.Choice]) -> Optional[handoff.Choice]:
     print("Resume which work?")
     for i, choice in enumerate(choices, start=1):
         print(f"  {i:>2}  {choice.line}")
@@ -389,6 +339,35 @@ def _pick(choices: List[_Choice]) -> Optional[_Choice]:
         if answer.isdigit() and 1 <= int(answer) <= len(choices):
             return choices[int(answer) - 1]
         print("  not a number from the list")
+
+
+def _cmd_mcp(args: argparse.Namespace) -> int:
+    from .mcp import McpServer, load_token, make_http_server, serve_stdio
+    from .worklog import git
+
+    ledger = Ledger(args.home)
+    repo = args.repo or (os.getcwd() if git(Path.cwd(), "rev-parse", "--show-toplevel") else None)
+    server = McpServer(ledger, repo)
+    if not args.http:
+        serve_stdio(server)  # stdout belongs to the protocol from here on
+        return 0
+    token = load_token(ledger.home, args.token)
+    try:
+        httpd = make_http_server(server, args.host, args.port, token)
+    except OSError as exc:
+        raise ConfigError(f"cannot listen on {args.host}:{args.port}: {exc.strerror or exc}") from None
+    port = httpd.server_address[1]
+    print(f"Tablely MCP server: http://{args.host}:{port}/mcp/{token}", file=sys.stderr)
+    print("For the Claude or ChatGPT app, expose it over HTTPS (e.g. cloudflared tunnel --url "
+          f"http://127.0.0.1:{port}) and add https://<tunnel>/mcp/{token} as a connector. Keep the URL secret.",
+          file=sys.stderr, flush=True)
+    try:
+        httpd.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+    return 0
 
 
 def _cmd_note(args: argparse.Namespace) -> int:

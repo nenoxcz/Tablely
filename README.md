@@ -19,7 +19,8 @@ Tablely는 작업 목록을 받아서:
 6. **다중 GPU와 장치 전환**: GPU 여러 장을 한 작업에 줄 수 있고, 아무도 기다리지 않으면 남는 GPU를 더 줍니다 (`max_gpus`). 실행 중인 작업도 GPU가 비면 GPU로, 더 중요한 작업이 GPU를 기다리면 CPU로 옮깁니다 (체크포인트 후 재시작, `switchable`).
 7. **큰 데이터 순차 업로드**: GPU 메모리나 RAM보다 큰 데이터를 조각으로 나눠 디스크 → RAM → PCIe 버스 → GPU 순서로 계속 흘려 보냅니다. CPU에서는 L3 캐시에 맞는 크기로 쪼개서 처리합니다 (`tablely.stream`).
 8. **달성률과 재개하기 (CLI)**: `tablely status`로 작업마다 달성률(%)을 막대로 봅니다. `tablely resume`으로 이어갈 작업을 고르면, 지금까지 한 일을 요약해서 AI CLI(예: `claude`)에게 넘겨 바로 시작합니다.
-9. **여러 에이전트와 핸드오프**: 같은 머신에서 여러 에이전트(AI 에이전트나 사람)가 각자 `tablely run`을 해도 GPU와 코어를 함께 계획합니다. 누가 무엇을 왜 돌리고 있는지는 자동으로 기록합니다. 그래서 다음 에이전트는 따로 인수인계 문서를 받지 않아도 `tablely brief`로 이어받을 수 있습니다.
+9. **AI 앱에서 참조 (MCP)**: `tablely mcp`를 연결해 두면 Claude 앱, Claude Desktop/Code, ChatGPT 앱에서 대화하다가 AI가 Tablely의 진행 상황과 재개 요약을 직접 꺼내 봅니다.
+10. **여러 에이전트와 핸드오프**: 같은 머신에서 여러 에이전트(AI 에이전트나 사람)가 각자 `tablely run`을 해도 GPU와 코어를 함께 계획합니다. 누가 무엇을 왜 돌리고 있는지는 자동으로 기록합니다. 그래서 다음 에이전트는 따로 인수인계 문서를 받지 않아도 `tablely brief`로 이어받을 수 있습니다.
 
 ## 설치
 
@@ -420,6 +421,73 @@ AI CLI 정하기:
 - `--print`: 요약만 출력 (예: `tablely resume claude-a --print | claude -p`)
 - 터미널이 아닌 곳(스크립트, 다른 에이전트)에서 대상 없이 부르면 고를 수 있는 목록만 출력합니다.
 
+## Claude 앱 · ChatGPT 앱에서 참조하기: `tablely mcp`
+
+`tablely mcp`는 Tablely를 MCP 서버로 엽니다. MCP를 지원하는 AI 앱에 한 번 연결해 두면, 대화하다가 "학습 어디까지 됐어?", "claude-a가 하던 거 이어서 해줘"라고 하면 AI가 Tablely를 직접 불러서 답합니다.
+
+| 도구 | 하는 일 |
+|---|---|
+| `tablely_status` | 달성률 막대 화면 (`tablely status`와 같음) |
+| `tablely_resume` | 이어서 할 작업의 요약. 대상(`target`)이 없으면 고를 수 있는 목록 |
+| `tablely_brief` | 핸드오프 요약 |
+| `tablely_history` | 지난 기록 |
+| `tablely_note` | 메모 남기기 (다음 에이전트가 status·요약에서 봄) |
+
+- 리소스 `tablely://status`, `tablely://brief`도 있습니다.
+- 프롬프트 `resume`도 있습니다. 앱의 프롬프트 메뉴에서 고르면 재개 요약이 대화에 들어갑니다.
+- 작업을 시작하거나 멈추는 도구는 없습니다. 쓰기 동작은 메모 남기기뿐입니다.
+
+### Claude Desktop · Claude Code: 같은 컴퓨터, 또는 SSH로 GPU 서버
+
+Claude Desktop 설정 파일(`claude_desktop_config.json`)의 `mcpServers`에 추가합니다.
+
+```json
+{
+  "mcpServers": {
+    "tablely": { "command": "tablely", "args": ["mcp", "--repo", "/path/to/your/repo"] }
+  }
+}
+```
+
+Tablely가 다른 GPU 서버에서 돈다면 SSH로 띄웁니다. SSH 키 로그인이 되어 있어야 합니다.
+
+```json
+{
+  "mcpServers": {
+    "tablely": { "command": "ssh", "args": ["gpu-server", "tablely", "mcp"] }
+  }
+}
+```
+
+Claude Code는 이렇게 추가합니다: `claude mcp add tablely -- tablely mcp`. GPU 서버라면 `claude mcp add tablely -- ssh gpu-server tablely mcp`.
+
+`--repo`를 주면 그 저장소의 코딩 에이전트 세션도 status와 재개 대상에 들어갑니다.
+
+### Claude 앱(웹·모바일) · ChatGPT 앱: 원격 커넥터
+
+이 앱들은 인터넷에서 닿는 HTTPS 주소의 MCP 서버만 연결할 수 있습니다.
+
+1. Tablely가 도는 컴퓨터에서 `tablely mcp --http`를 실행합니다. 비밀 주소가 출력됩니다: `http://127.0.0.1:8766/mcp/<토큰>`
+2. HTTPS 터널로 밖에 내보냅니다. 예: `cloudflared tunnel --url http://127.0.0.1:8766` (Tailscale Funnel, ngrok 등도 됩니다)
+3. 앱에서 커넥터를 추가하고 주소에 `https://<터널 주소>/mcp/<토큰>`을 넣습니다.
+   - Claude 앱: 설정의 커넥터 메뉴에서 사용자 지정 커넥터를 추가합니다.
+   - ChatGPT 앱: 설정에서 개발자 모드를 켜고 커넥터를 추가합니다.
+   - 메뉴 이름은 앱 버전에 따라 다를 수 있습니다.
+   - Claude Code에서는 `claude mcp add --transport http tablely https://<터널 주소>/mcp/<토큰>`으로 추가합니다.
+
+토큰 관리:
+- 토큰은 `~/.tablely/mcp-token`(권한 600)에 저장돼서 다시 띄워도 주소가 같습니다.
+- 바꾸려면 그 파일을 지우세요. `--token`이나 `TABLELY_MCP_TOKEN`으로 직접 정할 수도 있습니다.
+- 경로에 토큰을 넣는 대신 `/mcp`에 `Authorization: Bearer <토큰>` 헤더로 보내도 됩니다.
+- **주소(토큰)가 곧 비밀번호입니다.** 주소를 아는 사람은 작업 상태와 기록을 보고 메모를 남길 수 있습니다. 토큰이 틀리면 404를 돌려줍니다.
+
+지금처럼 클라우드에서 도는 Claude Code 세션은 GitHub 저장소를 받아서 일합니다. 그래서 코딩 쪽 작업 기록(`.agents/sessions`)은 따로 설정하지 않아도 세션 시작 때 핸드오프로 들어옵니다. 학습 쪽 상태까지 보려면 그 환경에서 위 원격 주소에 접속할 수 있어야 하는데, 이는 환경의 네트워크 설정에 따라 다릅니다.
+
+프로토콜:
+- MCP 2024-11-05 ~ 2025-11-25(initialize 핸드셰이크 방식)를 표준 라이브러리만으로 구현했습니다.
+- 2026-07-28 방식을 먼저 시도하는 최신 클라이언트도 이 방식으로 자동 전환합니다.
+- 공식 MCP Python SDK(2.3.0) 클라이언트로 stdio와 HTTP 둘 다 연결해서 모든 도구, 리소스, 프롬프트를 확인했습니다.
+
 ## 그 밖의 동작
 
 - 각 작업은 자기만의 프로세스 그룹에서 실행됩니다. 메인 프로세스가 끝나면 남아 있는 자식 프로세스(DataLoader 워커 등)도 정리해서 GPU 메모리와 코어를 확실히 돌려받습니다.
@@ -439,11 +507,13 @@ AI CLI 정하기:
 | `tablely/ledger.py` | 머신 공용 장부: 실행/작업 등록, 죽은 실행 정리, 이벤트 기록 |
 | `tablely/affinity.py` | 프로세스 그룹 전체 코어 고정 (Linux) |
 | `tablely/config.py` | TOML/YAML/JSON 작업 파일 로딩 |
-| `tablely/cli.py` | `tablely resources / plan / run / status / history / brief / resume / note` |
+| `tablely/cli.py` | `tablely resources / plan / run / status / history / brief / resume / mcp / note` |
 | `tablely/client.py` | 학습 스크립트용 선택적 헬퍼 (`device`, `progress`, `note`, `switch_requested`, `exit_for_switch` ...) |
 | `tablely/stream.py` | 큰 데이터 순차 업로드: 메모리 맵 → 고정 RAM 버퍼 → GPU, CPU는 L3 크기 블록 |
 | `tablely/progress.py` | 실행·에이전트 달성률 계산, 재개 요약(`resume_prompt`, `session_prompt`), AI CLI 실행 |
 | `tablely/board_view.py` | `tablely status`(달성률 막대) / `history` / `brief` 출력 |
+| `tablely/handoff.py` | CLI와 MCP가 같이 쓰는 부분: status 화면, 재개 대상 찾기와 요약 |
+| `tablely/mcp.py` | `tablely mcp`: MCP 서버 (stdio, 토큰이 필요한 HTTP) |
 | `tablely/worklog.py` | 코딩 에이전트 작업 기록 (hook 처리, 할 일 목록, 핸드오프, 브리핑) |
 | `tools/agent_log.py` | `tablely/worklog.py`를 설치 없이 실행하는 스크립트 (hooks가 사용, 아래 참고) |
 
