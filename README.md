@@ -17,7 +17,7 @@ Tablely는 작업 목록을 받아서:
 4. **중요도 비례 분배**: 최소 코어를 보장한 뒤 남는 코어는 중요도에 비례해 나눕니다.
 5. **재분배**: 작업이 끝날 때마다 다시 계획합니다. 대기 중인 작업을 시작하고, 실행 중인 작업의 코어를 늘리거나 줄입니다.
 6. **다중 GPU와 장치 전환**: GPU 여러 장을 한 작업에 줄 수 있고, 아무도 기다리지 않으면 남는 GPU를 더 줍니다 (`max_gpus`). 실행 중인 작업도 GPU가 비면 GPU로, 더 중요한 작업이 GPU를 기다리면 CPU로 옮깁니다 (체크포인트 후 재시작, `switchable`).
-7. **큰 데이터 순차 업로드**: GPU 메모리나 RAM보다 큰 데이터를 조각으로 나눠 디스크 → RAM → PCIe 버스 → GPU 순서로 계속 흘려 보냅니다. CPU에서는 L3 캐시에 맞는 크기로 쪼개서 처리합니다 (`tablely.stream`).
+7. **큰 데이터 순차 업로드**: GPU 메모리나 RAM보다 큰 데이터를 조각으로 나눠 디스크 → RAM → PCIe 버스 → GPU 순서로 계속 흘려 보냅니다. CPU에서는 L3 캐시에 맞는 크기로 쪼개서 처리합니다 (`tablely.stream`). 임베딩 같은 큰 표는 미리 잡아 둔 RAM에 두고 VRAM 대신 씁니다. GPU 메모리가 모자라면 자동으로 RAM으로 옮깁니다 (`ram`, `tablely.tables`).
 8. **달성률과 재개하기 (CLI)**: `tablely status`로 작업마다 달성률(%)을 막대로 봅니다. `tablely resume`으로 이어갈 작업을 고르면, 지금까지 한 일을 요약해서 AI CLI(예: `claude`)에게 넘겨 바로 시작합니다.
 9. **AI 앱에서 참조 (MCP)**: `tablely mcp`를 연결해 두면 Claude 앱, Claude Desktop/Code, ChatGPT 앱에서 대화하다가 AI가 Tablely의 진행 상황과 재개 요약을 직접 꺼내 봅니다.
 10. **여러 에이전트와 핸드오프**: 같은 머신에서 여러 에이전트(AI 에이전트나 사람)가 각자 `tablely run`을 해도 GPU와 코어를 함께 계획합니다. 누가 무엇을 왜 돌리고 있는지는 자동으로 기록합니다. 그래서 다음 에이전트는 따로 인수인계 문서를 받지 않아도 `tablely brief`로 이어받을 수 있습니다.
@@ -190,6 +190,7 @@ gpus = [0, 1]             # 정수 = N장, 리스트/문자열 = 그 ID들. 기�
 reserve_cpus = 1          # 앞쪽 N개 코어는 OS/Tablely용으로 남김
 gpu_memory = "24GiB"      # GPU 한 장의 메모리. nvidia-smi로 감지가 안 될 때만 (gpu_memory 작업용)
 mps = false               # true면 MPS 데몬이 있다고 보고 나눠 쓰는 작업에 CUDA_MPS_* 제한도 설정
+ram = "200GiB"            # 작업들이 표용으로 예약할 수 있는 RAM (기본: 전체 RAM의 절반)
 
 [[jobs]]
 name = "llm-finetune"     # 영문/숫자/._- (로그 파일 이름으로 씀)
@@ -207,6 +208,7 @@ task = "lr 1e-3, warmup 500"  # 이 작업만의 목적 (기본: 위의 task)
 switchable = false        # true면 체크포인트 후 CPU<->GPU로 옮겨질 수 있음 (아래 참고)
 # gpu_share = 0.5         # GPU 한 장의 이만큼만 사용, 나머지는 다른 작업과 나눠 씀 (배분 규칙 7, max_gpus와 함께 못 씀)
 # gpu_memory = "10GiB"    # 또는 GPU 메모리 양으로 요청 (gpu_share와 함께 쓸 수 없음)
+ram = "32GiB"             # 시작 전에 잡아 두는 RAM, tablely.tables가 표를 둘 자리 (아래 참고)
 ```
 
 `command`는 문자열 또는 리스트입니다. 아래 자리표시자는 작업 시작 시점의 값으로 바뀝니다.
@@ -220,7 +222,7 @@ switchable = false        # true면 체크포인트 후 CPU<->GPU로 옮겨질 �
 | `{cpu_list}` | 코어 목록 (`4-7`) |
 | `{name}` | 작업 이름 |
 
-CLI 옵션 `--cpus`, `--gpus`, `--reserve-cpus`, `--gpu-memory`, `--backfill`, `--mps`, `--log-dir`, `--task`는 작업 파일 설정보다 우선합니다.
+CLI 옵션 `--cpus`, `--gpus`, `--reserve-cpus`, `--gpu-memory`, `--ram`, `--backfill`, `--mps`, `--log-dir`, `--task`는 작업 파일 설정보다 우선합니다.
 
 ## 학습 스크립트와 연동
 
@@ -239,6 +241,7 @@ Tablely는 작업마다 다음 환경변수를 넣어 줍니다.
 | `TABLELY_SWITCHABLE`, `TABLELY_RESTARTS` | 장치 이동 가능 여부, 지금까지 이동한 횟수 (재시작이면 1 이상) |
 | `TABLELY_CONTROL`, `TABLELY_REPLY` | 장치 이동 요청을 주고받는 파일 (`client.switch_requested` / `exit_for_switch`가 사용) |
 | `TABLELY_GPU_SHARE`, `TABLELY_GPU_MEMORY` | GPU를 나눠 쓸 때만: 받은 비율(`0.5`)과 바이트 단위 메모리 몫 (`client.gpu_share()` / `gpu_memory()`) |
+| `TABLELY_RAM` | `ram`을 적은 작업만: 잡아 둔 RAM (바이트, `client.ram()`, `tables.store()`가 사용) |
 | `XLA_PYTHON_CLIENT_MEM_FRACTION`, `TF_FORCE_GPU_ALLOW_GROWTH`, `CUDA_MPS_*` | GPU를 나눠 쓸 때만: 프레임워크별 메모리 제한 ([배분 규칙 7](#7-gpu-나눠-쓰기-gpu_share--gpu_memory)) |
 
 환경변수만 읽어도 되지만, 선택적으로 쓸 수 있는 헬퍼도 있습니다.
@@ -341,6 +344,71 @@ outputs = stream.map_chunks(lambda x: model(x).cpu(), data)
   - CPU에 배치됐거나 PyTorch가 CUDA를 못 쓰면 CPU로 계산합니다.
 - `chunks(...)`의 `.stats`로 실제 상황을 볼 수 있습니다: 옮긴 바이트, 걸린 시간, 데이터를 기다린 시간. 기다린 시간이 길면 디스크나 버스가 병목입니다.
 - **L3 캐시**는 프로그램이 "여기에 올려라"라고 지정할 수 없고, GPU로 가는 DMA는 RAM에서 읽습니다. 그래서 GPU 경로는 RAM(고정 버퍼)을 거치고, L3는 CPU 계산을 캐시 크기에 맞춰 쪼개는 데 씁니다.
+
+## RAM을 VRAM 대신 쓰기: `ram`과 `tablely.tables`
+
+임베딩 테이블, 특징 테이블, 룩업 테이블 같은 큰 표는 모델과 함께 GPU 메모리에 다 올라가지 않을 때가 많습니다. 작업 파일에 `ram`을 적으면 Tablely가 작업을 시작하기 전에 그만큼의 RAM을 그 작업 몫으로 잡아 둡니다. 학습 스크립트는 `tablely.tables`로 큰 표를 이 RAM에 두고, 스텝마다 필요한 행만 GPU로 가져다 씁니다.
+
+```toml
+[[jobs]]
+name = "recsys"
+command = "python train.py"
+ram = "32GiB"          # 시작 전에 잡아 두는 RAM. 이만큼 비어 있어야 시작합니다
+```
+
+```python
+from tablely import tables
+
+store = tables.store()                 # Tablely가 잡아 둔 RAM을 지금 한 번에 할당하고 고정(pinned)
+emb = store.put("item_emb", weights)   # VRAM 예산 안이면 GPU, 넘치면 그 RAM에
+vecs = emb.gather(ids)                 # 표가 어디에 있든 결과 행은 GPU에
+emb.add_rows(ids, -lr * grads)         # 희소 업데이트 (제자리)
+
+step = store.guard(train_step)         # GPU 메모리가 부족하면 표를 RAM으로 옮기고 스텝을 다시 실행
+for batch in loader:
+    loss = step(batch)
+```
+
+**미리 잡아 두기**
+- Tablely는 `ram`을 코어처럼 배분합니다. 실행 중인 작업들의 `ram` 합이 머신에서 예약할 수 있는 RAM을 넘지 않게 하고, 모자라면 작업이 기다립니다 (`needs 32GiB of RAM, 10GiB free`).
+- 예약할 수 있는 RAM은 `[resources] ram`(또는 `--ram`)으로 정합니다. 기본은 전체 RAM의 절반입니다. 고정된 RAM은 스왑되지 않으니 OS와 다른 프로세스 몫을 남겨 둬야 하기 때문입니다.
+- 엄격한 우선순위에서는 GPU나 RAM을 기다리는 중요한 작업의 RAM 몫도 미리 빼 둡니다.
+- 작업 안에서는 `tables.store()`를 처음 부를 때 그 RAM을 한 덩어리로 할당하고 페이지를 고정합니다. 학습 도중에 RAM을 새로 구하지 않고, 처음에 확보한 자리에 표를 올립니다.
+
+**표를 어디에 두나**
+- VRAM 예산 안에서는 GPU에, 넘치면 RAM에 둡니다. 예산의 기본값은 이 작업이 쓸 수 있는 GPU 메모리의 절반입니다 (GPU를 나눠 쓰면 받은 몫의 절반).
+- `put(..., where="gpu")` 또는 `where="ram"`으로 직접 정할 수 있습니다.
+- RAM에 있는 표에서 `gather`하면 CPU가 그 행들만 모아서, 고정 메모리에서 PCIe로 비동기 전송합니다. 표 전체가 버스를 타지 않습니다.
+
+**학습이 걸리면 자동으로 RAM으로**
+
+`store.guard`로 감싼 스텝이 GPU 메모리 부족(OOM)으로 실패하면:
+1. 실패한 스텝의 텐서를 놓고 캐시된 GPU 메모리를 비웁니다.
+2. GPU에 있는 표 중 가장 큰 것을 RAM으로 옮깁니다. `keep_on_gpu=True`로 넣은 표는 옮기지 않습니다.
+3. 스텝을 다시 실행합니다. 또 부족하면 다음 표를 옮깁니다. 옮길 표가 없으면 원래 오류를 그대로 냅니다.
+
+학습은 멈추지 않고 조금 느려질 뿐입니다. 메모리가 다시 넉넉해지면 `store.promote()`로 자주 쓰는 표부터 GPU로 되돌립니다.
+
+주의할 점:
+- 스텝은 다시 실행해도 안전해야 합니다. 시작할 때 gradient를 0으로 만들고, 갱신(optimizer step, `add_rows`)은 마지막에 하세요. 메모리 부족은 거의 항상 forward/backward에서 나므로 갱신 전에 걸립니다.
+- 표 데이터는 `Table` 메서드(`gather`, `rows`, `set_rows`, `add_rows`)로 다루세요. `emb.data`를 다른 변수에 붙잡아 두면 표를 RAM으로 옮겨도 GPU 메모리가 풀리지 않습니다.
+
+**다른 에이전트에게 보이는 것**
+- `tablely status`의 작업 줄에 `ram 6GiB/8GiB`(RAM에 있는 표 / 잡아 둔 RAM)가 나오고, 머신 줄 아래에 RAM 예약 현황이 나옵니다.
+- 표를 옮기거나 다시 올린 일은 `tablely history`에 `tables` 이벤트로 남습니다.
+
+```
+machine  16 CPU core(s) [0-15] · 1 GPU(s) [0 (24GiB)] · strict priority
+gpu use  0 ██████████ 100% 1 job
+ram use  ██░░░░░░░░  25% 32GiB of 128GiB reserved by 1 job
+...
+    recsys  ████░░░░░░  40%  running  GPU 0 · cores 0-3 (4) · ram 20GiB/32GiB · prio 5
+```
+
+그 밖에:
+- GPU가 없는 작업(CPU에 배정된 작업)은 모든 표를 RAM에 둡니다. PyTorch가 있으면 표는 torch 텐서, 없으면 NumPy 배열입니다.
+- `tablely.stream`과의 차이: `stream`은 큰 데이터를 처음부터 끝까지 순서대로 흘려 보낼 때 씁니다. `tables`는 표의 아무 행이나 골라서 자주 읽고 쓸 때 씁니다.
+- 예시: [`examples/ram_tables.toml`](examples/ram_tables.toml), [`examples/table_train.py`](examples/table_train.py) (사용자·아이템 임베딩 학습).
 
 ## 여러 에이전트가 한 머신을 같이 쓸 때
 
@@ -566,6 +634,7 @@ Claude Code는 이렇게 추가합니다: `claude mcp add tablely -- tablely mcp
 | `tablely/cli.py` | `tablely resources / plan / run / status / history / brief / resume / mcp / note` |
 | `tablely/client.py` | 학습 스크립트용 선택적 헬퍼 (`device`, `progress`, `note`, `limit_gpu_memory`, `switch_requested`, `exit_for_switch` ...) |
 | `tablely/stream.py` | 큰 데이터 순차 업로드: 메모리 맵 → 고정 RAM 버퍼 → GPU, CPU는 L3 크기 블록 |
+| `tablely/tables.py` | 큰 표를 미리 잡아 둔 RAM에 두고 GPU에서 쓰기, 메모리 부족 시 GPU → RAM 자동 이동 |
 | `tablely/progress.py` | 실행·에이전트 달성률 계산, 재개 요약(`resume_prompt`, `session_prompt`), AI CLI 실행 |
 | `tablely/board_view.py` | `tablely status`(달성률 막대) / `history` / `brief` 출력 |
 | `tablely/handoff.py` | CLI와 MCP가 같이 쓰는 부분: status 화면, 재개 대상 찾기와 요약 |
@@ -606,7 +675,7 @@ Claude Code 같은 코딩 에이전트 여러 개가 이 저장소를 동시에 
 
 - **데몬 + `tablely submit`**: 이미 돌고 있는 실행에 작업을 추가하거나 취소. 지금은 새 작업 목록마다 `tablely run`을 하나 더 띄워야 합니다.
 - **선점(preemption) 확대**: 지금은 `switchable` 작업만 체크포인트 후 CPU로 옮기는 방식으로 GPU를 내줍니다. GPU 전용 작업을 멈췄다가 나중에 재개하는 일반 선점은 아직 없습니다.
-- **실제 GPU 서버 검증**: `tablely.stream`의 CUDA 경로(고정 메모리, 비동기 복사, 다중 GPU `map_chunks`)는 GPU가 없는 환경에서 만들었습니다. 파이프라인 로직은 대역(가짜 backend)으로 테스트했지만 실제 GPU에서는 아직 돌려보지 않았습니다. GPU 나눠 쓰기의 MPS 변수, MIG 감지, `limit_gpu_memory`도 실제 하드웨어에서는 아직 확인하지 않았습니다.
+- **실제 GPU 서버 검증**: `tablely.stream`의 CUDA 경로(고정 메모리, 비동기 복사, 다중 GPU `map_chunks`)는 GPU가 없는 환경에서 만들었습니다. 파이프라인 로직은 대역(가짜 backend)으로 테스트했지만 실제 GPU에서는 아직 돌려보지 않았습니다. GPU 나눠 쓰기의 MPS 변수, MIG 감지, `limit_gpu_memory`도 실제 하드웨어에서는 아직 확인하지 않았습니다. `tablely.tables`의 PyTorch 경로(고정 메모리, 행 단위 비동기 전송, CUDA 메모리 부족 처리)도 가짜 GPU로만 테스트했습니다.
 - **사용량 기반 나눠 쓰기**: 지금은 요청한 몫(`gpu_share`/`gpu_memory`)만 보고 배치합니다. 실제 GPU 메모리 사용량(nvidia-smi)을 보고 더 채우거나 막는 기능은 아직 없습니다.
 - **토폴로지 인지**: GPU와 같은 NUMA 노드의 코어를 우선 배정.
 - **사용률 기반 조정**: 실제 GPU/CPU 사용률을 보고 코어를 재분배. 예를 들어 GPU 사용률이 낮으면 데이터 로딩 코어를 늘립니다.

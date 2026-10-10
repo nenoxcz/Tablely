@@ -50,6 +50,8 @@ def test_yaml_and_json(tmp_path):
         ({"jobs": [{"name": "a", "command": "x", "gpu_memory": "big"}]}, "gpu_memory"),
         ({"resources": {"gpu_memory": "big"}, "jobs": [{"name": "a", "command": "x"}]}, "gpu_memory"),
         ({"resources": {"mps": "yes"}, "jobs": [{"name": "a", "command": "x"}]}, "mps"),
+        ({"resources": {"ram": "lots"}, "jobs": [{"name": "a", "command": "x"}]}, "ram"),
+        ({"jobs": [{"name": "a", "command": "x", "ram": -1}]}, "ram"),
     ],
 )
 def test_invalid_job_files_are_rejected(data, message):
@@ -85,3 +87,14 @@ def test_shared_gpu_example_fits_on_one_gpu(capsys):
     assert main(["plan", str(example), "--gpus", "1", "--cpus", "4", "--gpu-memory", "24GiB"]) == 0
     out = capsys.readouterr().out
     assert out.count("start") == 3 and "gpu use: 0 100%" in out
+
+
+def test_ram_keys():
+    config = parse_config({"resources": {"ram": "64GiB"}, "jobs": [{"name": "a", "command": "x", "ram": "8GiB"}]})
+    assert config.jobs[0].ram == 8 * 1024 ** 3
+    assert config.inventory().ram == 64 * 1024 ** 3
+
+
+def test_ram_tables_example_loads():
+    config = load_config(EXAMPLE.with_name("ram_tables.toml"))
+    assert config.jobs[0].ram == 256 * 1024 ** 2 and config.jobs[0].device is Device.ANY

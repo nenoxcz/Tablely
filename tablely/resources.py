@@ -18,11 +18,14 @@ class Inventory:
 
     ``gpu_memory`` lines up with ``gpus`` (bytes, or None when unknown); it is
     what ``gpu_memory`` requests of shared-GPU jobs are measured against.
+    ``ram`` is how much RAM jobs may reserve for tables (``ram`` in a job),
+    or None when RAM is not handed out.
     """
 
     cpus: Tuple[int, ...]
     gpus: Tuple[str, ...]
     gpu_memory: Tuple[Optional[int], ...] = ()
+    ram: Optional[int] = None
 
     def memory_of(self, gpu: str) -> Optional[int]:
         try:
@@ -42,6 +45,7 @@ class Inventory:
         return (
             f"{len(self.cpus)} CPU core(s) [{format_cpu_list(self.cpus)}], "
             f"{len(self.gpus)} GPU(s) [{', '.join(self.gpu_labels()) or 'none'}]"
+            + (f", {format_bytes(self.ram)} RAM for tables" if self.ram else "")
         )
 
 
@@ -117,6 +121,21 @@ def detect_cpus() -> List[int]:
     if hasattr(os, "sched_getaffinity"):
         return sorted(os.sched_getaffinity(0))
     return list(range(os.cpu_count() or 1))
+
+
+def total_ram_bytes() -> Optional[int]:
+    """Physical RAM of this machine (MemTotal on Linux), or None if unknown."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        return None
 
 
 def detect_gpus(env: Optional[Mapping[str, str]] = None) -> List[str]:
@@ -197,6 +216,7 @@ def build_inventory(
     reserve_cpus: int = 0,
     simulate: bool = False,
     gpu_memory: Union[None, int, str] = None,
+    ram: Union[None, int, str] = None,
 ) -> Inventory:
     """Build the inventory, optionally narrowing what was detected.
 
@@ -210,6 +230,8 @@ def build_inventory(
     of a bigger server); never use it for real runs.
     ``gpu_memory``: memory of each GPU (e.g. ``"24GiB"``), when it cannot be
     detected or should be overridden.
+    ``ram``: RAM jobs may reserve for tables (e.g. ``"200GiB"``); default half
+    of the machine's RAM, since reserved RAM is pinned and cannot be swapped.
     """
     detected = detect_cpus()
     if cpus is None:
@@ -260,4 +282,10 @@ def build_inventory(
             found = dict(detect_gpu_devices())
         memory = [found.get(gpu) for gpu in gpu_ids]
 
-    return Inventory(cpus=tuple(cpu_ids), gpus=tuple(gpu_ids), gpu_memory=tuple(memory))
+    if ram is not None:
+        ram_bytes: Optional[int] = parse_bytes(ram)
+    else:
+        total = total_ram_bytes()
+        ram_bytes = total // 2 if total else None
+
+    return Inventory(cpus=tuple(cpu_ids), gpus=tuple(gpu_ids), gpu_memory=tuple(memory), ram=ram_bytes)

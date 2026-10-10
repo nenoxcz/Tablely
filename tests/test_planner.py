@@ -350,3 +350,40 @@ def test_check_feasible_needs_gpu_memory_sizes_for_memory_requests():
     errors, warnings = check_feasible(mem_inv(24 * GiB), [job("m", device="any", gpu_memory="40GiB")])
     assert not errors and "always run on CPU" in warnings[0]
     assert check_feasible(mem_inv(24 * GiB), [job("m", gpu_memory="24GiB")]) == ([], [])
+
+
+# -- RAM reserved for tables --------------------------------------------------
+
+
+def ram_inv(ram, cpus=8, gpus=2):
+    return Inventory(cpus=tuple(range(cpus)), gpus=tuple(str(i) for i in range(gpus)), ram=ram)
+
+
+def test_jobs_wait_until_their_ram_is_free():
+    running = {"a": Allocation("gpu", ("0",), (0,))}
+    specs = jobs(job("a", ram="40GiB"), job("b", ram="30GiB"), job("c", device="cpu"))
+    p = plan(ram_inv(64 * GiB), specs, running, ["b", "c"])
+    assert p.waiting["b"] == "needs 30GiB of RAM, 24GiB free"
+    assert "c" in p.allocations  # needs no RAM: not held back by b
+    assert first_round(ram_inv(64 * GiB), jobs(job("a", ram="40GiB"), job("b", ram="24GiB"))).started == ["a", "b"]
+
+
+def test_strict_priority_holds_ram_for_a_blocked_job():
+    running = {"a": Allocation("gpu", ("0",), (0,))}
+    specs = jobs(job("a", ram="40GiB"), job("top", priority=9, ram="30GiB"), job("low", ram="10GiB"))
+    p = plan(ram_inv(64 * GiB), specs, running, ["top", "low"])
+    assert p.waiting["low"] == "RAM held for a higher-priority job"
+    p = plan(ram_inv(64 * GiB), specs, running, ["top", "low"], Policy(backfill=True))
+    assert "low" in p.allocations
+    # a job waiting for a GPU keeps its RAM set aside too
+    specs = jobs(job("a"), job("top", priority=9, gpus=2, ram="60GiB"), job("low", device="cpu", ram="10GiB"))
+    p = plan(ram_inv(64 * GiB), specs, running, ["top", "low"])
+    assert p.waiting["low"] == "needs 10GiB of RAM, 4GiB free"
+
+
+def test_ram_is_not_planned_when_the_inventory_does_not_hand_it_out():
+    assert first_round(inv(), jobs(job("a", ram="1TiB"))).started == ["a"]
+    errors, _ = check_feasible(ram_inv(64 * GiB), [job("a", ram="100GiB")])
+    assert "only 64GiB can be reserved" in errors[0]
+    with pytest.raises(ValueError, match="ram"):
+        job("x", ram="plenty")

@@ -2,11 +2,11 @@
   "session": "905a0ab8-ad25-5709-a2f8-2206ab23ba69",
   "agent": "claude",
   "branch": "nenoxcz/kind-maxwell-onq8cl",
-  "status": "idle",
-  "task": "GPU sharing: gpu_share/gpu_memory packing, memory limits (JAX/TF env, PyTorch helper), MPS, MIG detection",
+  "status": "working",
+  "task": "RAM as VRAM substitute: reserve pinned RAM per job, keep big tables there, spill from GPU on OOM",
   "task_source": "agent",
   "started_at": "2026-10-08T05:38:03Z",
-  "updated_at": "2026-10-10T07:22:33Z",
+  "updated_at": "2026-10-10T07:39:33Z",
   "prompts": [
     {
       "at": "2026-10-08T07:05:34Z",
@@ -31,6 +31,10 @@
     {
       "at": "2026-10-10T07:06:56Z",
       "text": "GPU 나눠쓰기"
+    },
+    {
+      "at": "2026-10-10T07:25:07Z",
+      "text": "학습이 조금 걸리면 그 전에 만들어둔 렘에 자동으로 테이블 올려두고 vram 대용으로 쓰는 그런 활용"
     }
   ],
   "files": [
@@ -38,16 +42,18 @@
     "tablely/progress.py",
     "tablely/dashboard.py",
     "tablely/_dashboard_page.py",
-    "tablely/mcp.py"
+    "tablely/mcp.py",
+    "tablely/tables.py",
+    "tests/test_tables.py"
   ],
   "handoff": {
-    "at": "2026-10-10T07:22:33Z",
-    "text": "Done: GPU sharing. Jobs ask for gpu_share (0..1) or gpu_memory (\"10GiB\"); planner.fit_gpus packs them best-fit, Allocation.gpu_share goes through the ledger; whole-GPU jobs only take fully free GPUs; strict priority still holds GPU admissions. runner.sharing_env sets TABLELY_GPU_SHARE/MEMORY, XLA_PYTHON_CLIENT_MEM_FRACTION, TF_FORCE_GPU_ALLOW_GROWTH and, with mps, CUDA_MPS_*; client.limit_gpu_memory() for PyTorch. GPU memory and MIG instances detected via nvidia-smi (or [resources] gpu_memory / --gpu-memory). Status shows a per-GPU 'gpu use' line; plan shows WANTS x0.5/6GiB. Next: try MPS vars, MIG detection and limit_gpu_memory on a real GPU server (untested here, no GPU); maybe usage-based packing from nvidia-smi. Caveat: shared jobs are never pushed to CPU by _switch_wishes (it would not free a GPU).",
-    "head": "c5ba1a4"
+    "at": "2026-10-10T07:39:33Z",
+    "text": "Done: RAM as VRAM substitute. Jobs reserve ram = \"32GiB\" before they start (planner hands RAM out like cores, [resources] ram / --ram, default half of MemTotal; strict priority holds it). tablely.tables: tables.store() pins that RAM once (Arena), put() places tables on GPU within the VRAM budget else in RAM, gather/rows/set_rows/add_rows, store.guard(step) moves the biggest GPU table to RAM on OOM and reruns the step, promote() moves tables back; moves are reported to the ledger (status 'ram 6GiB/8GiB', 'ram use' line, history 'tables' events). Example: examples/ram_tables.toml + table_train.py. Next: run TorchBackend on a real GPU (pinned arena views, index_select into pinned rows, OOM detection) - only tested with FakeGpu since PyTorch can't be installed here. Caveat: a guarded step must be safe to rerun (zero grads first, updates last).",
+    "head": "a5508af"
   },
   "last_reply": {
-    "at": "2026-10-10T07:05:12Z",
-    "text": "Claude 앱이나 ChatGPT 앱에서도 Tablely를 참조할 수 있도록 `tablely mcp`를 추가해 푸시했습니다. MCP는 AI 앱이 외부 도구에 연결할 때 쓰는 표준 방식입니다. 연결해 두면 대화 중에 \"학습 어디까지 됐어?\", \"claude-a가 하던 거 이어서 해줘\"라고 하면 AI가 Tablely를 직접 불러서 답합니다. 테스트 120개가 통과합니다. **AI가 쓸 수 있는 기능** - **상태 보기**: `tablely status`와 같은 달성률 막대 화면 - **재개 요약**: 이어서 할 작업의 요약. 대상을 안 주면 고를 수 있는 목록이 나옵니다 - **핸드오프 요약, 지난 기록 보기** - **메모 남기기**: 다음에 일할 에이전트가 볼 수 있습니다 - 작업을 시작하거나 멈추는 기능은 넣지 않았습니다. AI가 쓸 수 있는 동작은 메모 남기기뿐입니다. **앱별 연결 방법** - **Claude Desktop / Claude Code**: 앱이 `tablely mcp`를 직접 실행합니다. Tablely가 GPU 서버에 있으면 명령을 `ssh gpu-server tablely mcp`로 등록하면 됩니다. Claude Code는 `clau…"
+    "at": "2026-10-10T07:23:02Z",
+    "text": "이제 작은 작업 여러 개가 GPU 한 장을 같이 쓸 수 있습니다. 커밋 `a5508af`를 `nenoxcz` 이름으로 `nenoxcz/kind-maxwell-onq8cl` 브랜치에 푸시했습니다. 테스트 145개가 Python 3.13과 3.10에서 모두 통과했습니다. 다만 이 환경에는 GPU가 없어서 실제 GPU에서는 아직 돌려보지 못했습니다. **쓰는 법** ```toml [[jobs]] name = \"small-cnn\" gpu_share = 0.5 # GPU 한 장의 절반 [[jobs]] name = \"probe\" gpu_memory = \"6GiB\" # 메모리 양으로 요청 (24GiB GPU라면 0.25) ``` **배분 규칙** - 작은 작업은 이미 가장 많이 찬 GPU부터 채웁니다. 그래서 통째로 쓸 수 있는 GPU가 최대한 많이 남습니다. - GPU를 통째로 쓰는 작업은 완전히 빈 GPU만 받습니다. - 엄격한 우선순위는 그대로입니다. 중요한 작업이 GPU를 기다리는 동안에는 덜 중요한 작업이 GPU의 남은 자리에 끼어들지 않습니다. - 공용 장부로 계획하므로, 다른 에이전트가 띄운 작업들도 같은 GPU에 함께 올라갑니다. - `device = \"…"
   },
   "start_commit": "e18c080",
   "todos": [
@@ -99,6 +105,21 @@
     {
       "id": "15",
       "subject": "GPU sharing: tests, docs, handoff, commit",
+      "status": "completed"
+    },
+    {
+      "id": "16",
+      "subject": "RAM tier: reserve RAM per job in planner/ledger/runner/config/CLI",
+      "status": "completed"
+    },
+    {
+      "id": "17",
+      "subject": "tablely.tables: tables in reserved RAM used from the GPU",
+      "status": "completed"
+    },
+    {
+      "id": "18",
+      "subject": "RAM tier: docs, example, handoff, commit",
       "status": "in_progress"
     }
   ]

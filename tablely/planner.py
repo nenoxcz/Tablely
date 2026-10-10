@@ -11,10 +11,11 @@ One scheduling round:
    it still fits on (best fit), so small jobs pack together and whole GPUs
    stay free for big ones. A ``device = "any"`` job that cannot get a GPU runs
    on CPU instead; a ``device = "gpu"`` job waits.
-2. Every job must also fit its guaranteed core count (``cpus``).
+2. Every job must also fit its guaranteed core count (``cpus``) and the
+   RAM it reserves for tables (``ram``), when the inventory hands out RAM.
 3. Strict priority (default): once a job has to wait, lower-priority jobs may
    not take what it is waiting for — free GPUs stay reserved for it and its
-   cores are set aside — so important jobs are never starved. With
+   cores and RAM are set aside — so important jobs are never starved. With
    ``backfill`` lower-priority jobs may use those resources in the meantime.
 4. GPUs still free when nobody is waiting for one go to jobs starting now
    that accept more (``max_gpus``), in proportion to priority. A running job's
@@ -94,11 +95,13 @@ def plan(
         name: (alloc.device, alloc.gpus, alloc.gpu_share) for name, alloc in running.items()
     }
     committed = sum(jobs[name].cpus for name in running)
+    ram_committed = sum(jobs[name].ram or 0 for name in running)
 
     started: List[str] = []
     waiting: Dict[str, str] = {}
     gpus_held_back = False  # a higher-priority job is waiting for GPUs
     cpus_held_back = False  # a higher-priority job is waiting for cores
+    ram_held_back = False  # a higher-priority job is waiting for RAM
     for name in sorted(pending, key=by_priority):
         spec = jobs[name]
         slot = None
@@ -112,6 +115,7 @@ def plan(
             if not policy.backfill:
                 gpus_held_back = True
                 committed += spec.cpus
+                ram_committed += spec.ram or 0
             continue
         if cpus_held_back or committed + spec.cpus > total_cpus:
             if cpus_held_back:
@@ -120,6 +124,17 @@ def plan(
                 waiting[name] = f"needs {spec.cpus} core(s), {max(total_cpus - committed, 0)} free"
             if not policy.backfill:
                 cpus_held_back = True
+            continue
+        if spec.ram and inventory.ram is not None and (
+            ram_held_back or ram_committed + spec.ram > inventory.ram
+        ):
+            if ram_held_back:
+                waiting[name] = "RAM held for a higher-priority job"
+            else:
+                free = format_bytes(max(inventory.ram - ram_committed, 0))
+                waiting[name] = f"needs {format_bytes(spec.ram)} of RAM, {free} free"
+            if not policy.backfill:
+                ram_held_back = True
             continue
 
         if slot is not None:
@@ -131,6 +146,7 @@ def plan(
         else:
             placed[name] = (CPU, (), None)
         committed += spec.cpus
+        ram_committed += spec.ram or 0
         started.append(name)
 
     gpu_wanted = any(jobs[name].device is not Device.CPU for name in waiting)
@@ -288,6 +304,11 @@ def check_feasible(inventory: Inventory, jobs: Sequence[JobSpec]) -> Tuple[List[
         if spec.name in seen:
             errors.append(f"duplicate job name {spec.name!r}")
         seen.add(spec.name)
+        if spec.ram and inventory.ram is not None and spec.ram > inventory.ram:
+            errors.append(
+                f"{spec.name}: reserves {format_bytes(spec.ram)} of RAM but only "
+                f"{format_bytes(inventory.ram)} can be reserved ([resources] ram)"
+            )
         if spec.cpus > len(inventory.cpus):
             errors.append(
                 f"{spec.name}: needs {spec.cpus} core(s) but only {len(inventory.cpus)} are available"

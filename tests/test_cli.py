@@ -73,3 +73,24 @@ gpu_memory = "6GiB"
     assert "gpu x0.5" in rows["half"] and "GPU 1 (share 0.5)" in rows["half"]
     assert "gpu 6GiB" in rows["small"] and "GPU 1 (share 0.25)" in rows["small"]
     assert "gpu use: 0 100% · 1 75%" in out
+
+
+def test_plan_shows_ram_reservations(tmp_path, capsys):
+    jobfile = tmp_path / "jobs.toml"
+    jobfile.write_text("""
+[[jobs]]
+name = "recsys"
+command = "x"
+ram = "40GiB"
+
+[[jobs]]
+name = "second"
+command = "x"
+device = "cpu"
+ram = "40GiB"
+""")
+    assert main(["plan", str(jobfile), "--cpus", "8", "--gpus", "1", "--ram", "64GiB"]) == 0
+    out = capsys.readouterr().out
+    assert "64GiB RAM for tables" in out
+    assert "gpu x1, 40GiB RAM" in out
+    assert "wait: needs 40GiB of RAM, 24GiB free" in out

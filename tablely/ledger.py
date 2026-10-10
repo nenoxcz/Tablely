@@ -124,7 +124,7 @@ def allocation_from_json(data: Optional[Mapping[str, Any]]) -> Optional[Allocati
 def pool_inventory(pool: Mapping[str, Any]) -> Inventory:
     """The shared pool recorded on the board, as an :class:`Inventory`."""
     return Inventory(cpus=tuple(pool["cpus"]), gpus=tuple(pool["gpus"]),
-                     gpu_memory=tuple(pool.get("gpu_memory") or ()))
+                     gpu_memory=tuple(pool.get("gpu_memory") or ()), ram=pool.get("ram"))
 
 
 def _empty_state() -> Dict[str, Any]:
@@ -169,6 +169,7 @@ class Board:
                 switchable=job.get("switchable", False),
                 gpu_share=job.get("gpu_share"),
                 gpu_memory=job.get("gpu_memory"),
+                ram=job.get("ram"),
             )
             if job["state"] == RUNNING:
                 running[key] = allocation_from_json(job["allocation"])
@@ -217,6 +218,7 @@ class Board:
             "cpus": list(inventory.cpus),
             "gpus": list(inventory.gpus),
             "gpu_memory": list(inventory.gpu_memory),
+            "ram": inventory.ram,
             "backfill": policy.backfill,
             "set_by": run_id,
             "set_at": time.time(),

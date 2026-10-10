@@ -1,0 +1,15 @@
+# A job whose embedding tables may not fit in GPU memory (see README: "RAM을 VRAM 대신 쓰기").
+#   tablely run examples/ram_tables.toml
+
+log_dir = "logs"
+task = "embeddings bigger than the GPU"
+
+[resources]
+# ram = "200GiB"       # RAM jobs may reserve for tables; default: half of this machine's RAM
+
+[[jobs]]
+name = "recsys-mf"
+command = "python3 table_train.py"
+device = "any"
+cpus = 2
+ram = "256MiB"         # set aside before the job starts; tables that do not fit in VRAM live here

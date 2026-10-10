@@ -21,7 +21,7 @@ from .config import Config, ConfigError, load_config
 from .ledger import Board, Ledger, default_agent, make_event, pool_inventory
 from .planner import Policy, check_feasible, plan
 from .progress import run_ai, save_prompt
-from .resources import build_inventory
+from .resources import build_inventory, format_bytes
 from .runner import Runner
 from .spec import format_priority
 
@@ -50,6 +50,8 @@ def _parser() -> argparse.ArgumentParser:
     resources.add_argument("--reserve-cpus", type=int, help="leave the lowest N cores to the OS")
     resources.add_argument("--gpu-memory", metavar="SIZE",
                            help="memory of each GPU, e.g. 24GiB, when nvidia-smi cannot tell (for gpu_memory jobs)")
+    resources.add_argument("--ram", metavar="SIZE",
+                           help="RAM jobs may reserve for tables, e.g. 200GiB (default: half of this machine's)")
 
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument("--home", help="state shared by all agents on this machine (default: $TABLELY_HOME or ~/.tablely)")
@@ -141,7 +143,8 @@ def _parser() -> argparse.ArgumentParser:
 
 def _cmd_resources(args: argparse.Namespace) -> int:
     try:
-        inventory = build_inventory(args.cpus, args.gpus, args.reserve_cpus or 0, gpu_memory=args.gpu_memory)
+        inventory = build_inventory(args.cpus, args.gpus, args.reserve_cpus or 0, gpu_memory=args.gpu_memory,
+                                    ram=args.ram)
     except ValueError as exc:
         raise ConfigError(str(exc)) from None
     print(inventory.describe())
@@ -152,7 +155,7 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     config = _load(args)
     # With explicit --cpus/--gpus/--reserve-cpus this is a what-if for some other
     # machine; otherwise plan around whatever other agents are running here.
-    what_if = any(v is not None for v in (args.cpus, args.gpus, args.reserve_cpus, args.gpu_memory))
+    what_if = any(v is not None for v in (args.cpus, args.gpus, args.reserve_cpus, args.gpu_memory, args.ram))
     board = None if what_if else Board(Ledger(args.home).snapshot())
     sharing = board is not None and bool(board.jobs) and board.data.get("pool")
     if sharing:
@@ -187,6 +190,8 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     for key, spec in sorted(ours.items(), key=lambda kv: -kv[1].priority):  # stable: ties keep file order
         alloc = decision.allocations.get(key)
         wants = f"{spec.device.value} {spec.describe_gpu_need()}".strip()
+        if spec.ram:
+            wants += f", {format_bytes(spec.ram)} RAM"
         status = "start" if alloc else f"wait: {decision.waiting[key]}"
         rows.append(
             [spec.name, format_priority(spec.priority), wants, _fmt.placement(alloc), _fmt.cores(alloc), status]
@@ -399,6 +404,8 @@ def _load(args: argparse.Namespace) -> Config:
         overrides["reserve_cpus"] = args.reserve_cpus
     if args.gpu_memory is not None:
         overrides["gpu_memory"] = args.gpu_memory
+    if args.ram is not None:
+        overrides["ram"] = args.ram
     if getattr(args, "mps", None):
         overrides["mps"] = True
     if args.backfill:

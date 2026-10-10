@@ -99,7 +99,7 @@ def render_command(spec: JobSpec, alloc: Allocation) -> Union[str, List[str]]:
     return [fill(part) for part in spec.command]
 
 
-SHARE_ENV_VARS = ("TABLELY_GPU_SHARE", "TABLELY_GPU_MEMORY")
+SHARE_ENV_VARS = ("TABLELY_GPU_SHARE", "TABLELY_GPU_MEMORY", "TABLELY_RAM")
 
 
 def sharing_env(spec: JobSpec, alloc: Allocation, gpu_total: Optional[int], mps: bool) -> Dict[str, str]:
@@ -147,7 +147,7 @@ def build_env(
     location).
     """
     env = dict(base)
-    for var in SHARE_ENV_VARS:  # never inherit another job's share
+    for var in SHARE_ENV_VARS:  # never inherit another job's GPU share or RAM
         env.pop(var, None)
     env.update(spec.env)
     values = job_values(spec, alloc)
@@ -157,6 +157,8 @@ def build_env(
     for var, value in sharing_env(spec, alloc, gpu_total, mps).items():
         if var not in spec.env or var in SHARE_ENV_VARS:
             env[var] = value
+    if spec.ram:
+        env["TABLELY_RAM"] = str(spec.ram)  # what tablely.tables may pin for this job
     env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")  # match nvidia-smi numbering
     env.update(
         {
@@ -372,6 +374,8 @@ class Runner:
             "max_gpus": spec.max_gpus,
             "gpu_share": spec.gpu_share,
             "gpu_memory": spec.gpu_memory,
+            "ram": spec.ram,
+            "tables": None,
             "switchable": spec.switchable,
             "switch_requested": None,
             "restarts": 0,

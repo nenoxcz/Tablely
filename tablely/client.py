@@ -87,6 +87,12 @@ def limit_gpu_memory() -> Optional[float]:
     return share
 
 
+def ram() -> Optional[int]:
+    """Bytes of RAM Tablely reserved for this job's tables (``ram`` in the job file), or None."""
+    value = os.environ.get("TABLELY_RAM")
+    return int(value) if value and value.isdigit() else None
+
+
 def num_cpus() -> int:
     """Cores this job may use *right now*.
 
@@ -146,19 +152,32 @@ def progress(
     if text is None:
         text = f"{done:g}/{total:g}" if done is not None and total else (
             f"{fraction:.0%}" if fraction is not None else "")
+    return _update_job({
+        "progress": " ".join(str(text).split())[:200],
+        "progress_frac": fraction,
+        "progress_at": time.time(),
+    })
+
+
+def _update_job(fields: dict, event: Optional[str] = None, detail: str = "") -> bool:
+    """Set ``fields`` on this job's ledger entry (and log ``event`` to the history).
+
+    Returns False, doing nothing, outside a ``tablely run``.
+    """
     home = os.environ.get("TABLELY_HOME")
     key = os.environ.get("TABLELY_JOB_KEY")
     if not home or not key:
         return False
-    from .ledger import Ledger
+    from .ledger import Ledger, make_event
 
     with Ledger(home).locked() as board:
         job = board.job(key)
         if job is None:
             return False
-        job["progress"] = " ".join(str(text).split())[:200]
-        job["progress_frac"] = fraction
-        job["progress_at"] = time.time()
+        job.update(fields)
+        if event:
+            board.log(make_event(time.time(), event, job.get("agent"), job.get("run"), job.get("name"),
+                                 job.get("task"), detail))
     return True
 
 

@@ -308,3 +308,19 @@ def test_agents_share_one_gpu_through_the_ledger(tmp_path):
         for r in (a, b, c):
             r._stop_all()
             r._unregister()
+
+
+def test_status_shows_reserved_ram(tmp_path):
+    ledger = Ledger(tmp_path / "home")
+    inventory = Inventory(cpus=CPUS, gpus=(), ram=64 * 1024 ** 3)
+    r = runner(tmp_path, [JobSpec(name="recsys", command=py("import time; time.sleep(5)"), device="cpu",
+                                  ram="16GiB")], ledger, "alice", inventory)
+    try:
+        r._register()
+        r._tick()
+        view = render_status(ledger.snapshot())
+        assert "ram use  ██░░░░░░░░  25% 16GiB of 64GiB reserved by 1 job" in view
+        assert "ram 16GiB" in view
+    finally:
+        r._stop_all()
+        r._unregister()

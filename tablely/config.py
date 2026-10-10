@@ -18,10 +18,10 @@ else:  # pragma: no cover
     import tomli as tomllib
 
 _TOP_KEYS = {"resources", "jobs", "log_dir", "backfill", "task", "switch_grace", "max_switches"}
-_RESOURCE_KEYS = {"cpus", "gpus", "reserve_cpus", "gpu_memory", "mps"}
+_RESOURCE_KEYS = {"cpus", "gpus", "reserve_cpus", "gpu_memory", "mps", "ram"}
 _JOB_KEYS = {
     "name", "command", "priority", "device", "gpus", "max_gpus", "cpus", "max_cpus",
-    "env", "cwd", "shell", "task", "switchable", "gpu_share", "gpu_memory",
+    "env", "cwd", "shell", "task", "switchable", "gpu_share", "gpu_memory", "ram",
 }
 
 
@@ -42,11 +42,12 @@ class Config:
     max_switches: int = 5  # device switches per job before it is no longer asked
     gpu_memory: Union[None, int, str] = None  # memory of each GPU, when nvidia-smi cannot tell
     mps: bool = False  # an NVIDIA MPS daemon runs: let the driver enforce GPU shares too
+    ram: Union[None, int, str] = None  # RAM jobs may reserve for tables (default: half the machine's)
 
     def inventory(self, simulate: bool = False) -> Inventory:
         try:
             return build_inventory(self.cpus, self.gpus, self.reserve_cpus, simulate=simulate,
-                                   gpu_memory=self.gpu_memory)
+                                   gpu_memory=self.gpu_memory, ram=self.ram)
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"resources: {exc}") from None
 
@@ -106,12 +107,12 @@ def parse_config(data: Any, base_dir: Union[str, Path] = ".") -> Config:
     if isinstance(max_switches, bool) or not isinstance(max_switches, int) or max_switches < 0:
         raise ConfigError("max_switches must be a non-negative integer")
 
-    gpu_memory = resources.get("gpu_memory")
-    if gpu_memory is not None:
-        try:
-            parse_bytes(gpu_memory)
-        except ValueError as exc:
-            raise ConfigError(f"[resources] gpu_memory: {exc}") from None
+    for key in ("gpu_memory", "ram"):
+        if resources.get(key) is not None:
+            try:
+                parse_bytes(resources[key])
+            except ValueError as exc:
+                raise ConfigError(f"[resources] {key}: {exc}") from None
     mps = resources.get("mps", False)
     if not isinstance(mps, bool):
         raise ConfigError("[resources] mps must be true or false")
@@ -130,8 +131,9 @@ def parse_config(data: Any, base_dir: Union[str, Path] = ".") -> Config:
         task=task,
         switch_grace=float(switch_grace),
         max_switches=max_switches,
-        gpu_memory=gpu_memory,
+        gpu_memory=resources.get("gpu_memory"),
         mps=mps,
+        ram=resources.get("ram"),
     )
 
 

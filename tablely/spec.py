@@ -37,6 +37,9 @@ class JobSpec:
     (``0.5`` = half) and ``gpu_memory`` for an amount of GPU memory
     (``"10GiB"``), which Tablely turns into the fraction of whichever GPU the
     job lands on. Shared jobs are packed onto the fullest GPU they still fit.
+
+    ``ram`` reserves RAM before the job starts, for tables kept outside GPU
+    memory (see :mod:`tablely.tables`); a job waits until that much is free.
     """
 
     name: str
@@ -54,6 +57,7 @@ class JobSpec:
     switchable: bool = False  # supports checkpoint + restart on another device
     gpu_share: Optional[float] = None  # fraction of one GPU (0 < x < 1); others may use the rest
     gpu_memory: Optional[Union[int, str]] = None  # GPU memory to set aside instead, e.g. "10GiB"
+    ram: Optional[Union[int, str]] = None  # RAM reserved for this job's tables (tablely.tables), e.g. "32GiB"
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.match(self.name):
@@ -103,6 +107,11 @@ class JobSpec:
             if self.max_gpus < self.gpus:
                 raise ValueError(f"{self.name}: max_gpus ({self.max_gpus}) is below gpus ({self.gpus})")
         self._check_sharing()
+        if self.ram is not None:
+            try:
+                object.__setattr__(self, "ram", parse_bytes(self.ram))
+            except ValueError as exc:
+                raise ValueError(f"{self.name}: ram: {exc}") from None
         if not isinstance(self.switchable, bool):
             raise ValueError(f"{self.name}: switchable must be true or false")
         object.__setattr__(self, "env", {str(k): str(v) for k, v in dict(self.env).items()})

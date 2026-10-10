@@ -9,7 +9,7 @@ from . import _fmt
 from .ledger import RUNNING, allocation_from_json, pool_inventory
 from .planner import gpu_load
 from .progress import collect_runs
-from .resources import format_cpu_list
+from .resources import format_bytes, format_cpu_list
 from .spec import format_priority
 
 NOTE_MAX_AGE = 24 * 3600  # notes older than this are hidden from `status`
@@ -43,6 +43,7 @@ def render_status(
         lines.append(f"machine  {len(pool['cpus'])} CPU core(s) [{format_cpu_list(pool['cpus'])}] · "
                      f"{len(pool['gpus'])} GPU(s) [{gpus}] · {mode}")
         lines += _gpu_use(pool, data.get("jobs", {}).values(), color)
+        lines += _ram_use(pool, data.get("jobs", {}).values(), color)
     if not live:
         lines.append("nobody is running Tablely jobs on this machine")
     for run in live:
@@ -121,6 +122,26 @@ def _gpu_use(pool: Mapping[str, Any], jobs: Iterable[Mapping[str, Any]], color: 
     return ["gpu use  " + " · ".join(parts)]
 
 
+def _ram_use(pool: Mapping[str, Any], jobs: Iterable[Mapping[str, Any]], color: bool) -> List[str]:
+    """``ram use  ██░░░░░░░░  25% 16GiB of 64GiB reserved by 2 jobs`` while any running job reserves RAM."""
+    reserved = [j["ram"] for j in jobs if j["state"] == RUNNING and j.get("ram")]
+    if not reserved or not pool.get("ram"):
+        return []
+    fraction = min(sum(reserved) / pool["ram"], 1.0)
+    bar = _fmt.paint(_fmt.bar(fraction, 10), "blue", color)
+    return [f"ram use  {bar} {_fmt.percent(fraction)} {format_bytes(sum(reserved))} of "
+            f"{format_bytes(pool['ram'])} reserved by {len(reserved)} job{'s' * (len(reserved) > 1)}"]
+
+
+def ram_label(entry: Mapping[str, Any]) -> str:
+    """``ram 6GiB/8GiB`` (tables in RAM / reserved), ``ram 8GiB`` before the job reports, or ``""``."""
+    tables = entry.get("tables") or {}
+    if not entry.get("ram") and not tables.get("ram"):
+        return ""
+    used = f"{format_bytes(tables['ram'])}/" if tables.get("ram") is not None and entry.get("ram") else ""
+    return f"ram {used}{format_bytes(entry.get('ram') or tables.get('ram'))}"
+
+
 def _run_block(run: Any, entries: Mapping[Any, Mapping[str, Any]], now: float, color: bool) -> List[str]:
     since = f"running {_fmt.duration(now - run.started)}" if run.started else "running"
     head = f"{run.agent} · {run.task or run.run}"
@@ -137,7 +158,8 @@ def _run_block(run: Any, entries: Mapping[Any, Mapping[str, Any]], now: float, c
         prio = f"prio {format_priority(entry['priority'])}" if "priority" in entry else ""
         if job.state == "running":
             alloc = allocation_from_json(entry.get("allocation"))
-            where = " · ".join(x for x in (_fmt.placement(alloc), f"cores {_fmt.cores(alloc)}", prio) if x)
+            where = " · ".join(x for x in (_fmt.placement(alloc), f"cores {_fmt.cores(alloc)}", ram_label(entry), prio)
+                               if x)
             info = job.progress or ""
             if entry.get("progress_at"):
                 info += f" ({_ago(now - entry['progress_at'])})"
