@@ -80,13 +80,32 @@ def task() -> Optional[str]:
     return os.environ.get("TABLELY_TASK")
 
 
-def progress(text: str) -> bool:
-    """Tell other agents how this job is doing, e.g. ``"epoch 3/10, loss 0.41"``.
+def progress(
+    text: Optional[str] = None,
+    *,
+    done: Optional[float] = None,
+    total: Optional[float] = None,
+    fraction: Optional[float] = None,
+) -> bool:
+    """Tell other agents how far this job is, e.g. ``progress("epoch 3/10, loss 0.41")``.
 
-    It shows up next to the job in ``tablely status``. Each call takes the
+    The completion rate comes from ``fraction`` (0..1), or ``done``/``total``,
+    or else is read from the text (``"3/10"``, ``"45%"``). It shows up as a
+    percentage in ``tablely status`` and the dashboard. Each call takes the
     shared lock briefly, so call it once per epoch or every few minutes, not
     every step. Returns False (and does nothing) outside a ``tablely run``.
     """
+    from .ledger import parse_fraction
+
+    if fraction is None and done is not None and total:
+        fraction = done / total
+    if fraction is None:
+        fraction = parse_fraction(text)
+    if fraction is not None:
+        fraction = min(max(float(fraction), 0.0), 1.0)
+    if text is None:
+        text = f"{done:g}/{total:g}" if done is not None and total else (
+            f"{fraction:.0%}" if fraction is not None else "")
     home = os.environ.get("TABLELY_HOME")
     key = os.environ.get("TABLELY_JOB_KEY")
     if not home or not key:
@@ -98,6 +117,7 @@ def progress(text: str) -> bool:
         if job is None:
             return False
         job["progress"] = " ".join(str(text).split())[:200]
+        job["progress_frac"] = fraction
         job["progress_at"] = time.time()
     return True
 

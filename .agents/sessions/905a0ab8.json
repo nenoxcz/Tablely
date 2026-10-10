@@ -3,10 +3,10 @@
   "agent": "claude",
   "branch": "nenoxcz/kind-maxwell-onq8cl",
   "status": "working",
-  "task": "Multi-GPU: elastic GPU counts, CPU<->GPU job switching, chunked streaming (disk->RAM->PCIe->GPU, L3-sized CPU blocks)",
+  "task": "Dashboard: completion %, Resume button that summarizes past work and hands it to an AI",
   "task_source": "agent",
   "started_at": "2026-10-08T05:38:03Z",
-  "updated_at": "2026-10-08T07:28:22Z",
+  "updated_at": "2026-10-10T06:42:17Z",
   "prompts": [
     {
       "at": "2026-10-08T07:05:34Z",
@@ -15,18 +15,26 @@
     {
       "at": "2026-10-08T07:14:27Z",
       "text": "다중 GPU, 자동 GPU 분배랑 CPU 연산 전환 이런거. 순차적 업로드로 좀 큰 자료도 램이나 L3 캐시에 올리고 버스 태우거나 램을 사용해서 순차적업로드도 가능하게 ㅇㅇ"
+    },
+    {
+      "at": "2026-10-10T06:28:46Z",
+      "text": "막 작업 하는거 달성률이나 그런걸로 보여주고, 재개하기 누르면 뭐 했었는지 요약해서 AI에게 넘겨주고 그런거"
     }
   ],
   "files": [
-    "tablely/stream.py"
+    "tablely/stream.py",
+    "tablely/progress.py",
+    "tablely/dashboard.py",
+    "tablely/_dashboard_page.py"
   ],
   "handoff": {
-    "at": "2026-10-08T07:28:22Z",
-    "text": "끝낸 것: max_gpus(남는 GPU 자동 분배), switchable 작업의 CPU<->GPU 협력 전환(exit 75, 요청 철회, grace/횟수 제한), tablely.stream(메모리맵->pinned RAM->PCIe->GPU, CPU는 L3 절반 크기, map_chunks 다중 GPU), examples/stream_train.py. 다음: 실제 GPU 서버에서 stream CUDA 경로 검증, GPU 전용 작업의 일반 선점, 데몬/tablely submit. 주의: torch/CUDA 경로는 테스트 환경에서 실행 불가(download.pytorch.org 차단).",
-    "head": "aee79c8"
+    "at": "2026-10-10T06:42:17Z",
+    "text": "끝낸 것: 진행률 숫자화(client.progress done/total, '3/10'/'45%' 해석), 실행·에이전트 달성률, tablely resume(요약 생성·저장·AI 실행), worklog를 tablely/worklog.py로 옮기고 할 일 목록(TaskCreate/TaskUpdate/TodoWrite)으로 세션 달성률, tablely ui 대시보드(재개하기 버튼, 토큰·Host 검사). 다음: 실제 GPU 서버에서 stream CUDA 경로 검증, 대시보드에서 실패 작업 재실행 버튼, 데몬/tablely submit. 주의: 대시보드 페이지는 서버 시작 시 읽으므로 고친 뒤 재시작 필요.",
+    "head": "e18c080"
   },
   "last_reply": {
-    "at": "2026-10-08T07:11:27Z",
-    "text": "네, 그렇게 이해하고 그 방향으로 맞췄습니다. 이전 세션이 손으로 핸드오프를 쓰지 않아도, 다음 에이전트가 Tablely에 쌓인 기록만 보고 이어받는 구조입니다. 변경은 푸시했고 테스트 69개가 모두 통과합니다. **학습을 돌리는 쪽: `tablely brief`** - 새로 온 에이전트가 컨텍스트에 그대로 넣을 수 있는 요약을 출력합니다. - 내용은 세 부분입니다. - 지금 돌고 있는 작업과 진행 상황 - 끝난 작업의 결과: 마지막 지표, 코드 커밋, 실패했다면 로그 위치 - 에이전트들이 `tablely note`로 남긴 \"다음에 할 일\" - 원래는 작업이 끝나면 마지막 진행 상황(예: `epoch 10/10, val acc 0.83`)이 사라졌는데, 이제 결과 기록에 남습니다. **코드를 고치는 쪽: 코딩 에이전트 세션 사이** - 새 세션은 첫 프롬프트 전에 핸드오프를 자동으로 받습니다. 최근 세션 3개가 무엇을 하다 어디서 멈췄는지, 어떤 파일을 고쳤는지, 지금 누가 작업 중인지가 들어 있습니다. - 어디서 멈췄는지는 두 가지 방법으로 남습니다. - **자동**: 에이전트가 응답을 마칠 때 마지막 답변이 저장됩니다. 다만 같은 머신 안에서만 보입니다…"
-  }
+    "at": "2026-10-08T07:28:40Z",
+    "text": "세 가지 모두 추가하고 푸시했습니다. 테스트 96개가 통과합니다. 다만 이 환경에는 GPU도 PyTorch도 없어서 **실제 GPU로 데이터를 보내는 부분은 아직 한 번도 실행되지 않았습니다.** PyTorch 다운로드 서버가 네트워크 정책으로 막혀 있었습니다. 그 주변의 순서·버퍼 관리 로직은 가짜 장치로 테스트했고, GPU 서버에서 처음 돌려볼 때 가장 먼저 확인할 부분입니다. **1. 다중 GPU와 자동 분배** - 작업 파일에 `gpus = 1`, `max_gpus = 4`(또는 `\"all\"`)를 적으면, 시작할 때 GPU를 기다리는 작업이 없으면 남는 GPU를 최대 4장까지 더 줍니다. 여러 작업이 걸리면 중요도 비례로 나눕니다. - 받은 장수는 `{num_gpus}`로 넘길 수 있습니다. 예: `torchrun --nproc_per_node {num_gpus} train.py` - 이미 실행 중인 작업의 GPU 수는 바뀌지 않습니다. **2. CPU ↔ GPU 연산 전환** 실행 중인 프로세스는 장치를 그 자리에서 바꿀 수 없어서, 작업과 Tablely가 협력하는 방식으로 만들었습니다. `switchable = true`로 표시한 작업에만 적용됩…"
+  },
+  "start_commit": "e18c080"
 }

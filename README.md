@@ -18,7 +18,8 @@ Tablely는 작업 목록을 받아서:
 5. **재분배**: 작업이 끝날 때마다 다시 계획합니다. 대기 중인 작업을 시작하고, 실행 중인 작업의 코어를 늘리거나 줄입니다.
 6. **다중 GPU와 장치 전환**: GPU 여러 장을 한 작업에 줄 수 있고, 아무도 기다리지 않으면 남는 GPU를 더 줍니다 (`max_gpus`). 실행 중인 작업도 GPU가 비면 GPU로, 더 중요한 작업이 GPU를 기다리면 CPU로 옮깁니다 (체크포인트 후 재시작, `switchable`).
 7. **큰 데이터 순차 업로드**: GPU 메모리나 RAM보다 큰 데이터를 조각으로 나눠 디스크 → RAM → PCIe 버스 → GPU 순서로 계속 흘려 보냅니다. CPU에서는 L3 캐시에 맞는 크기로 쪼개서 처리합니다 (`tablely.stream`).
-8. **여러 에이전트와 핸드오프**: 같은 머신에서 여러 에이전트(AI 에이전트나 사람)가 각자 `tablely run`을 해도 GPU와 코어를 함께 계획합니다. 누가 무엇을 왜 돌리고 있는지는 자동으로 기록합니다. 그래서 다음 에이전트는 따로 인수인계 문서를 받지 않아도 `tablely brief`로 이어받을 수 있습니다.
+8. **대시보드**: `tablely ui`로 작업마다 달성률(%)을 막대로 봅니다. **재개하기**를 누르면 지금까지 한 일을 요약해서 AI에게 넘겨줍니다 (복사하거나 AI를 바로 실행).
+9. **여러 에이전트와 핸드오프**: 같은 머신에서 여러 에이전트(AI 에이전트나 사람)가 각자 `tablely run`을 해도 GPU와 코어를 함께 계획합니다. 누가 무엇을 왜 돌리고 있는지는 자동으로 기록합니다. 그래서 다음 에이전트는 따로 인수인계 문서를 받지 않아도 `tablely brief`로 이어받을 수 있습니다.
 
 ## 설치
 
@@ -195,8 +196,12 @@ model.to(device)
 for epoch in range(epochs):
     client.sync_torch_threads()  # 코어가 늘거나 줄었으면 torch 스레드 수를 맞춤
     ...
-    client.progress(f"epoch {epoch + 1}/{epochs}, val acc {acc:.3f}")  # tablely status에 표시
+    client.progress(f"epoch {epoch + 1}/{epochs}, val acc {acc:.3f}")  # tablely status와 대시보드에 표시
 ```
+
+`client.progress`의 달성률(%)은 다음 순서로 정합니다.
+1. 숫자로 직접 준 값: `client.progress("warmup", done=3, total=10)` 또는 `fraction=0.3`
+2. 없으면 텍스트에서 읽은 값: `"epoch 3/10"` → 30%, `"45%"` → 45%
 
 `any` 작업을 쓸 때는 장치에 따라 배치 크기 등을 바꾸고 싶을 수 있습니다. 그럴 때는 `command`에 `--device {device}`를 넘겨서 스크립트에서 분기하면 됩니다.
 
@@ -296,6 +301,8 @@ tablely status                 # 지금 누가 무엇을 어디서 돌리는지 
 tablely history                # 지난 기록 (--agent, --job, -n, --json)
 tablely note --agent claude-a "lr sweep 끝나면 baseline과 비교 예정"   # 지금 하는 일, 다음 할 일 메모
 tablely brief                  # 다음 에이전트에게 넘길 핸드오프 요약 (--hours, --agent, --json)
+tablely resume --agent claude-a   # 그 에이전트가 한 일을 AI가 이어받을 수 있게 요약 (--run, --session, --launch)
+tablely ui                     # 웹 대시보드: 달성률, 재개하기 버튼
 tablely plan vit.toml          # 다른 에이전트의 작업을 고려한 배치 미리보기
 ```
 
@@ -360,6 +367,31 @@ machine: 4 core(s), GPUs [0], strict priority
 - 장부 디렉터리에는 `state.json`(현재 상태)과 `history.jsonl`(이벤트, 한 줄에 JSON 하나)이 있습니다. 파일 잠금(`flock`)으로 동시 접근을 막습니다.
 - 같은 머신의 같은 사용자끼리만 공유됩니다. 다른 머신과는 공유되지 않습니다.
 
+## 대시보드: 달성률과 재개하기 (`tablely ui`)
+
+```bash
+tablely ui                                  # http://127.0.0.1:8765 (GPU 서버라면: ssh -L 8765:127.0.0.1:8765 서버)
+tablely ui --resume-command "claude -p"     # 재개하기를 누르면 AI를 바로 실행
+```
+
+![Tablely 대시보드](docs/dashboard.png)
+
+- **에이전트 / 학습 작업**: 실행(run)마다 달성률과 작업별 진행 막대를 보여줍니다. 실행 중인 것과 최근(기본 72시간) 끝난 것이 모두 나오고, 3초마다 갱신됩니다.
+- **달성률 계산**:
+  - 실행: (끝난 작업 수 + 실행 중인 작업들의 진행률 합) ÷ 전체 작업 수. 실패하거나 취소된 작업은 0으로 칩니다.
+  - 에이전트: 그 에이전트의 모든 작업을 같은 방식으로 합칩니다.
+- **코딩 세션**: 저장소 안에서 실행하면(또는 `--repo`) 그 저장소에서 일한 코딩 에이전트 세션도 보여줍니다. 달성률은 에이전트 자신의 할 일 목록에서 완료된 비율입니다 (Claude Code의 작업 목록을 hook이 자동으로 기록).
+- **재개하기**: 누르면 그 카드의 작업을 AI가 이어받을 수 있게 요약합니다.
+  - 요약 내용 (학습 작업): 목표, 달성률, 끝난 작업의 결과와 마지막 지표, 실패 원인과 로그 위치, 진행 중·대기 작업, 에이전트가 남긴 메모, 이어서 할 일
+  - 요약 내용 (코딩 세션): 할 일 목록(완료/진행 중/남음), 핸드오프, 사용자가 요청했던 것, 고친 파일, 브랜치
+  - 요약은 `$TABLELY_HOME/resume/`(기본 `~/.tablely/resume/`)에 저장되고 창에 표시됩니다. **복사**를 눌러 AI에게 붙여넣으면 됩니다.
+  - `--resume-command`(또는 `TABLELY_RESUME_COMMAND`)를 주면 요약을 들고 AI를 바로 실행합니다. 요약은 명령의 마지막 인자로 넘어갑니다. 파일 경로로 넘기려면 명령에 `{prompt_file}`을 쓰세요. AI의 출력은 요약 파일 옆 `.log`에 남습니다.
+- 버튼 없이 같은 요약을 터미널에서 만들 수도 있습니다: `tablely resume --agent claude-a`, `tablely resume --run <id>`, `tablely resume --session <id 앞자리> --repo .`. `--launch "claude -p"`를 붙이면 AI도 실행합니다.
+- **보안**:
+  - 기본으로 `127.0.0.1`에서만 열립니다.
+  - 재개하기 요청은 이 서버가 보여준 페이지에 들어 있는 토큰이 있어야 처리됩니다. 그래서 다른 웹페이지가 몰래 AI 실행을 요청할 수 없습니다.
+  - 다른 호스트 이름으로 들어온 요청도 거절합니다.
+
 ## 그 밖의 동작
 
 - 각 작업은 자기만의 프로세스 그룹에서 실행됩니다. 메인 프로세스가 끝나면 남아 있는 자식 프로세스(DataLoader 워커 등)도 정리해서 GPU 메모리와 코어를 확실히 돌려받습니다.
@@ -380,10 +412,13 @@ machine: 4 core(s), GPUs [0], strict priority
 | `tablely/board_view.py` | `tablely status` / `history` 출력 |
 | `tablely/affinity.py` | 프로세스 그룹 전체 코어 고정 (Linux) |
 | `tablely/config.py` | TOML/YAML/JSON 작업 파일 로딩 |
-| `tablely/cli.py` | `tablely resources / plan / run / status / history / note / brief` |
+| `tablely/cli.py` | `tablely resources / plan / run / status / history / note / brief / resume / ui` |
 | `tablely/client.py` | 학습 스크립트용 선택적 헬퍼 (`device`, `progress`, `note`, `switch_requested`, `exit_for_switch` ...) |
 | `tablely/stream.py` | 큰 데이터 순차 업로드: 메모리 맵 → 고정 RAM 버퍼 → GPU, CPU는 L3 크기 블록 |
-| `tools/agent_log.py` | 이 저장소를 개발하는 코딩 에이전트의 작업 기록 (아래 참고) |
+| `tablely/progress.py` | 실행·에이전트 달성률 계산, 재개 요약(`resume_prompt`, `session_prompt`), AI에게 넘기기 |
+| `tablely/dashboard.py`, `tablely/_dashboard_page.py` | `tablely ui` 웹 서버와 페이지 (표준 라이브러리만 사용) |
+| `tablely/worklog.py` | 코딩 에이전트 작업 기록 (hook 처리, 할 일 목록, 핸드오프, 브리핑) |
+| `tools/agent_log.py` | `tablely/worklog.py`를 설치 없이 실행하는 스크립트 (hooks가 사용, 아래 참고) |
 
 테스트: `pip install -e '.[test,yaml]' && pytest` (GPU 경로의 CUDA 복사 부분은 GPU 없는 환경에서는 실행되지 않습니다)
 
@@ -397,6 +432,7 @@ Claude Code 같은 코딩 에이전트 여러 개가 이 저장소를 동시에 
   - 작업 내용
   - 최근 프롬프트 첫 줄
   - 수정한 파일
+  - 에이전트의 할 일 목록과 완료 여부 (달성률). 실시간 사본에만 바로 반영되고, 커밋 사본에는 다음 수정이나 `handoff` 때 들어갑니다.
 - 파일이 세션별로 나뉘어 있어서 여러 에이전트가 동시에 써도 충돌하지 않습니다. 작업과 함께 커밋하면 다른 머신의 에이전트도 그 브랜치에서 볼 수 있습니다.
 - 커밋되는 이 파일은 에이전트가 파일을 수정할 때만 갱신됩니다. 그래서 로그 때문에 작업 트리가 혼자 더러워지는 일은 없습니다. 상태와 프롬프트 같은 실시간 정보는 커밋되지 않는 `.git/agent-sessions/`에 바로 반영되고, 같은 clone의 모든 worktree가 이 디렉터리를 함께 봅니다.
 - **새 세션은 첫 프롬프트 전에 핸드오프를 자동으로 받습니다.** 대상은 이 체크아웃, 같은 clone의 다른 worktree, 모든 원격 브랜치입니다. 받는 내용은 다음과 같습니다.

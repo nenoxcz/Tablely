@@ -8,14 +8,20 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from . import _fmt
 from .ledger import RUNNING, allocation_from_json
+from .progress import agent_achievement, collect_runs
 from .resources import format_cpu_list
 from .spec import format_priority
 
 NOTE_MAX_AGE = 24 * 3600  # notes older than this are hidden from `status`
 
 
-def render_status(data: Mapping[str, Any], now: Optional[float] = None) -> str:
+def render_status(
+    data: Mapping[str, Any], now: Optional[float] = None, events: Sequence[Mapping[str, Any]] = ()
+) -> str:
+    """``events`` (the history) lets completion rates count jobs live runs already finished."""
     now = time.time() if now is None else now
+    live = [r for r in collect_runs(data, events) if r.live]
+    done_by_agent = {a: agent_achievement(r for r in live if r.agent == a) for a in {r.agent for r in live}}
     runs: Mapping[str, Dict[str, Any]] = data.get("runs", {})
     jobs: Mapping[str, Dict[str, Any]] = data.get("jobs", {})
     notes = {
@@ -57,6 +63,7 @@ def render_status(data: Mapping[str, Any], now: Optional[float] = None) -> str:
             rows.append(
                 [
                     agent,
+                    f"{done_by_agent[agent]:.0%}" if agent in done_by_agent else "-",
                     str(entry["runs"]),
                     str(entry["running"]),
                     str(entry["waiting"]),
@@ -64,7 +71,7 @@ def render_status(data: Mapping[str, Any], now: Optional[float] = None) -> str:
                     note_text,
                 ]
             )
-        lines += ["", "agents:", _fmt.table(["AGENT", "RUNS", "RUNNING", "WAITING", "TASK", "NOTE"], rows)]
+        lines += ["", "agents:", _fmt.table(["AGENT", "DONE", "RUNS", "RUNNING", "WAITING", "TASK", "NOTE"], rows)]
 
     if jobs:
         ordered = sorted(
@@ -86,6 +93,7 @@ def render_status(data: Mapping[str, Any], now: Optional[float] = None) -> str:
             else:
                 state, since, info = "waiting", job.get("submitted_at") or now, job.get("wait_reason") or ""
                 alloc = None
+            frac = job.get("progress_frac") if job["state"] == RUNNING else None
             rows.append(
                 [
                     job["agent"],
@@ -93,6 +101,7 @@ def render_status(data: Mapping[str, Any], now: Optional[float] = None) -> str:
                     _clip(job.get("task") or "-", 28),
                     format_priority(job["priority"]),
                     state,
+                    f"{frac:.0%}" if frac is not None else "-",
                     _fmt.placement(alloc),
                     _fmt.cores(alloc),
                     _fmt.duration(now - since),
@@ -102,7 +111,7 @@ def render_status(data: Mapping[str, Any], now: Optional[float] = None) -> str:
         lines += [
             "",
             "jobs:",
-            _fmt.table(["AGENT", "JOB", "TASK", "PRIO", "STATE", "ON", "CORES", "TIME", "INFO"], rows),
+            _fmt.table(["AGENT", "JOB", "TASK", "PRIO", "STATE", "DONE", "ON", "CORES", "TIME", "INFO"], rows),
         ]
     return "\n".join(lines)
 
@@ -160,6 +169,15 @@ def render_brief(
             f"machine: {len(pool['cpus'])} core(s), GPUs [{','.join(pool['gpus']) or 'none'}], {mode}"
         )
 
+    runs = [r for r in collect_runs(data, events) if wanted(r.agent) and (r.live or (r.ended or 0) >= since)]
+    lines += ["", "## Progress"]
+    if not runs:
+        lines.append("- no runs in this window")
+    for r in runs:
+        counts = ", ".join(f"{r.count(s)} {s}" for s in ("ok", "failed", "running", "waiting") if r.count(s))
+        lines.append(f"- [{r.agent}] {r.task or r.run}: {r.achievement:.0%} done ({counts or 'no jobs'})"
+                     + ("" if r.live else ", ended"))
+
     lines += ["", "## Now"]
     jobs = [j for j in data.get("jobs", {}).values() if wanted(j["agent"])]
     if not jobs:
@@ -173,7 +191,8 @@ def render_brief(
                 f"{_fmt.duration(now - (job.get('started_at') or now))} so far"
             )
             if job.get("progress"):
-                body += f"; progress: {job['progress']}"
+                frac = job.get("progress_frac")
+                body += f"; progress: {job['progress']}" + (f" ({frac:.0%})" if frac is not None else "")
             if job.get("orphan"):
                 body += "; its runner is gone"
         else:

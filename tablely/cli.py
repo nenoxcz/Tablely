@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import re
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import List, Optional, Sequence, Union
 
 from . import __version__, _fmt
@@ -16,6 +18,7 @@ from .board_view import render_brief, render_history, render_status
 from .config import Config, ConfigError, load_config
 from .ledger import Board, Ledger, default_agent, make_event
 from .planner import Policy, check_feasible, plan
+from .progress import collect_runs, hand_to_ai, resume_prompt, session_prompt
 from .resources import Inventory, build_inventory
 from .runner import Runner
 from .spec import format_priority
@@ -87,6 +90,31 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--agent", help="only this agent's work")
     p.add_argument("--json", action="store_true", help="print the board and the events as JSON")
     p.set_defaults(func=_cmd_brief)
+
+    p = sub.add_parser(
+        "resume",
+        parents=[shared],
+        help="summarize past work so an AI can continue it (print it, or start the AI with it)",
+    )
+    p.add_argument("--agent", help="resume this agent's runs (default: every agent in the window)")
+    p.add_argument("--run", help="resume one run (id from `tablely history`)")
+    p.add_argument("--session", help="resume a coding session from the work log (id prefix)")
+    p.add_argument("--repo", default=".", help="repository whose work log --session reads (default: .)")
+    p.add_argument("--hours", type=float, default=72.0, help="how far back to look (default 72)")
+    p.add_argument("--launch", metavar="COMMAND", default=None,
+                   help='start an AI with the summary, e.g. "claude -p" (default: $TABLELY_RESUME_COMMAND)')
+    p.add_argument("--print-only", action="store_true", help="never launch, even if TABLELY_RESUME_COMMAND is set")
+    p.set_defaults(func=_cmd_resume)
+
+    p = sub.add_parser("ui", parents=[shared], help="web dashboard: completion rates and a Resume button per run")
+    p.add_argument("--host", default="127.0.0.1", help="address to listen on (default 127.0.0.1)")
+    p.add_argument("--port", type=int, default=8765, help="port (default 8765, 0 = any free port)")
+    p.add_argument("--repo", default=None,
+                   help="also show this repository's coding sessions (default: the current git repo, if any)")
+    p.add_argument("--hours", type=float, default=72.0, help="how far back finished work is shown (default 72)")
+    p.add_argument("--resume-command", default=None,
+                   help='start an AI with the summary on Resume, e.g. "claude -p" (default: $TABLELY_RESUME_COMMAND)')
+    p.set_defaults(func=_cmd_ui)
 
     p = sub.add_parser("note", parents=[shared], help="record what an agent is working on or what comes next")
     p.add_argument("text", nargs="+")
@@ -194,11 +222,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_status(args: argparse.Namespace) -> int:
-    data = Ledger(args.home).snapshot()
+    ledger = Ledger(args.home)
+    data = ledger.snapshot()
     if args.json:
         print(json.dumps(data, indent=2, ensure_ascii=False))
     else:
-        print(render_status(data))
+        print(render_status(data, events=ledger.history()))
     return 0
 
 
@@ -221,6 +250,68 @@ def _cmd_brief(args: argparse.Namespace) -> int:
         print(json.dumps({"board": data, "events": events}, indent=2, ensure_ascii=False))
     else:
         print(render_brief(data, events, hours=args.hours, agent=args.agent))
+    return 0
+
+
+def _cmd_resume(args: argparse.Namespace) -> int:
+    ledger = Ledger(args.home)
+    if args.session:
+        from .worklog import find_session
+
+        session = find_session(args.repo, args.session)
+        if session is None:
+            raise ConfigError(f"no coding session starting with {args.session!r} in {args.repo}")
+        prompt, label, cwd = session_prompt(session), f"session-{session['session'][:8]}", args.repo
+    else:
+        prompt, label = _training_prompt(ledger, args.agent, args.run, args.hours)
+        cwd = None
+    command = None if args.print_only else (args.launch or os.environ.get("TABLELY_RESUME_COMMAND"))
+    result = hand_to_ai(prompt, ledger.home / "resume", label, command=command, cwd=cwd)
+    print(prompt)
+    print(f"\n(saved to {result['prompt_file']})", file=sys.stderr)
+    if result.get("launched"):
+        print(f"started `{command}` with it (pid {result['pid']}, output in {result['log']})", file=sys.stderr)
+    elif result.get("error"):
+        print(f"tablely: {result['error']}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _training_prompt(ledger: Ledger, agent: Optional[str], run: Optional[str], hours: float):
+    since = time.time() - hours * 3600
+    events = ledger.history()
+    runs = [
+        r for r in collect_runs(ledger.snapshot(), events)
+        if (run is None or r.run.startswith(run)) and (agent is None or r.agent == agent)
+        and (run is not None or r.live or (r.ended or 0) >= since)
+    ]
+    if not runs:
+        raise ConfigError("nothing to resume: no matching runs" + (f" in the last {hours:g}h" if not run else ""))
+    agents = {r.agent for r in runs}
+    notes = [e for e in events if e.get("event") == "note" and e.get("agent") in agents
+             and e.get("t", 0) >= since][-10:][::-1]
+    who = agent or (runs[0].agent if len(agents) == 1 else ", ".join(sorted(agents)))
+    label = f"run-{run}" if run else f"agent-{who}"
+    return resume_prompt(runs, notes, agent=who), label
+
+
+def _cmd_ui(args: argparse.Namespace) -> int:
+    from .dashboard import Dashboard, serve
+    from .worklog import git
+
+    repo = args.repo
+    if repo is None and git(Path.cwd(), "rev-parse", "--show-toplevel"):
+        repo = str(Path.cwd())
+    dashboard = Dashboard(
+        Ledger(args.home),
+        repo=repo,
+        hours=args.hours,
+        resume_command=args.resume_command or os.environ.get("TABLELY_RESUME_COMMAND"),
+    )
+    try:
+        serve(dashboard, args.host, args.port)
+    except OSError as exc:
+        raise ConfigError(f"cannot listen on {args.host}:{args.port}: {exc.strerror or exc}") from None
     return 0
 
 

@@ -204,3 +204,54 @@ def test_explicit_handoff_reaches_the_next_session_on_another_machine(tmp_path):
     assert "handoff (" in out and "next: benchmark 256 cores" in out
     briefing = tool(second, "brief", env={"CLAUDE_CODE_SESSION_ID": "e5e5e5e5-0012"})
     assert briefing.count("d4d4d4d4") == 1 and "e5e5e5e5" not in briefing
+
+
+def test_task_list_gives_a_completion_rate(tmp_path):
+    repo = make_repo(tmp_path / "repo")
+    sid = "f6f6f6f6-0013"
+    hook(repo, "PostToolUse", sid, tool_name="TaskCreate", tool_input={"subject": "add progress", "description": "x"},
+         tool_response={"task": {"id": "1", "subject": "add progress"}})
+    hook(repo, "PostToolUse", sid, tool_name="TaskCreate", tool_input={"subject": "add dashboard", "description": "x"},
+         tool_response="Task #2 created successfully: add dashboard")
+    hook(repo, "PostToolUse", sid, tool_name="TaskCreate", tool_input={"subject": "typo task", "description": "x"},
+         tool_response={"task": {"id": "3"}})
+    hook(repo, "PostToolUse", sid, tool_name="TaskUpdate", tool_input={"taskId": "1", "status": "completed"})
+    hook(repo, "PostToolUse", sid, tool_name="TaskUpdate", tool_input={"taskId": "2", "status": "in_progress"})
+    hook(repo, "PostToolUse", sid, tool_name="TaskUpdate", tool_input={"taskId": "3", "status": "deleted"})
+    todos = entry(repo, sid)["todos"]
+    assert [(t["id"], t["status"]) for t in todos] == [("1", "completed"), ("2", "in_progress")]
+    assert dirty(repo) == ""  # task updates stay in the live copy
+
+    out = hook(repo, "SessionStart", "g7g7g7g7-0014")
+    assert "tasks 1/2 done" in out and "not done: add dashboard" in out
+    assert "1/2" in tool(repo, "board")
+
+    hook(repo, "PostToolUse", sid, tool_name="TodoWrite", tool_input={"todos": [
+        {"content": "a", "status": "completed", "activeForm": "A"},
+        {"content": "b", "status": "completed", "activeForm": "B"},
+    ]})
+    assert [t["subject"] for t in entry(repo, sid)["todos"]] == ["a", "b"]
+
+
+def test_resume_prompt_for_a_coding_session(tmp_path, isolated_tablely_home):
+    repo = make_repo(tmp_path / "repo")
+    sid = "h8h8h8h8-0015"
+    hook(repo, "SessionStart", sid)
+    hook(repo, "UserPromptSubmit", sid, prompt="show progress and a resume button")
+    hook(repo, "PostToolUse", sid, tool_name="TaskCreate", tool_input={"subject": "progress %", "description": "x"},
+         tool_response={"task": {"id": "1"}})
+    hook(repo, "PostToolUse", sid, tool_name="TaskCreate", tool_input={"subject": "resume button", "description": "x"},
+         tool_response={"task": {"id": "2"}})
+    hook(repo, "PostToolUse", sid, tool_name="TaskUpdate", tool_input={"taskId": "1", "status": "completed"})
+    hook(repo, "PostToolUse", sid, tool_name="Edit", tool_input={"file_path": str(repo / "ui.py")})
+    tool(repo, "handoff", "progress done; next: the resume button", env={"CLAUDE_CODE_SESSION_ID": sid})
+
+    result = subprocess.run([sys.executable, "-m", "tablely", "resume", "--session", "h8h8", "--repo", str(repo)],
+                            capture_output=True, text=True, cwd=Path(__file__).resolve().parent.parent)
+    assert result.returncode == 0, result.stderr
+    prompt = result.stdout
+    assert "Task list (1/2 done, 50%)" in prompt
+    assert "- [x] progress %" in prompt and "- [ ] resume button" in prompt
+    assert "next: the resume button" in prompt and "show progress and a resume button" in prompt
+    assert "ui.py" in prompt and "branch `main`" in prompt
+    assert "saved to" in result.stderr

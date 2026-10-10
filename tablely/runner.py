@@ -295,7 +295,8 @@ class Runner:
                 self._put(board, name, self._new_entry(name, board.next_seq(), now))
             self._outbox.append(
                 make_event(now, "run-start", self.agent, self.run_id, None, self.task,
-                           f"{len(self.specs)} job(s): {', '.join(self.specs)}")
+                           f"{len(self.specs)} job(s): {', '.join(self.specs)}", jobs=list(self.specs),
+                           job_tasks={n: s.task for n, s in self.specs.items() if s.task})
             )
             self._flush(board)
 
@@ -340,6 +341,7 @@ class Runner:
             "started_at": None,
             "log": None,
             "progress": None,
+            "progress_frac": None,
             "progress_at": None,
             "orphan": False,
         }
@@ -608,7 +610,8 @@ class Runner:
     def _outcome(self, name: str, **extra: Any) -> Dict[str, Any]:
         """What the next agent needs about a finished job: last progress, code version, log."""
         entry = self._shadow.get(name) or {}
-        return dict(extra, progress=entry.get("progress"), git=entry.get("git"), log=entry.get("log"))
+        return dict(extra, progress=entry.get("progress"), progress_frac=entry.get("progress_frac"),
+                    git=entry.get("git"), log=entry.get("log"))
 
     def _finish(self, rec: JobRecord) -> int:
         """Kill whatever is left of the job's process group, then reap the leader.

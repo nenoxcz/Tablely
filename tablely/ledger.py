@@ -21,6 +21,7 @@ import contextlib
 import getpass
 import json
 import os
+import re
 import socket
 import time
 from pathlib import Path
@@ -85,6 +86,23 @@ def process_alive(pid: Optional[int], identity: Optional[str] = None) -> bool:
         if current is not None and current != identity:
             return False
     return True
+
+
+_RATIO = re.compile(r"(\d+(?:\.\d+)?)\s*/\s*(\d+(?:\.\d+)?)")
+_PERCENT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+
+
+def parse_fraction(text: Optional[str]) -> Optional[float]:
+    """Read how far along a progress line is: ``"epoch 3/10"`` -> 0.3, ``"45%"`` -> 0.45."""
+    if not text:
+        return None
+    ratio = _RATIO.search(text)
+    if ratio and float(ratio.group(2)) > 0:
+        return min(max(float(ratio.group(1)) / float(ratio.group(2)), 0.0), 1.0)
+    percent = _PERCENT.search(text)
+    if percent:
+        return min(max(float(percent.group(1)) / 100, 0.0), 1.0)
+    return None
 
 
 def allocation_to_json(alloc: Optional[Allocation]) -> Optional[Dict[str, Any]]:
