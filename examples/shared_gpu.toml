@@ -1,0 +1,27 @@
+# Several small jobs sharing one GPU (see README: "GPU 나눠 쓰기").
+#   tablely plan examples/shared_gpu.toml                              # on a GPU machine
+#   tablely plan examples/shared_gpu.toml --gpus 1 --gpu-memory 24GiB  # preview without one
+
+log_dir = "logs"
+task = "small models on one GPU"
+
+[resources]
+# gpu_memory = "24GiB" # only needed when nvidia-smi cannot report it (for gpu_memory jobs)
+# mps = true           # an MPS daemon runs (nvidia-cuda-mps-control -d): the driver enforces shares too
+
+[[jobs]]
+name = "small-cnn"
+command = "python3 fake_train.py --device {device} --seconds 10"
+priority = 3
+gpu_share = 0.5        # half of a GPU; PyTorch scripts call client.limit_gpu_memory()
+
+[[jobs]]
+name = "tiny-mlp"
+command = "python3 fake_train.py --device {device} --seconds 8"
+device = "any"         # runs on CPU if no GPU has 6GiB left
+gpu_memory = "6GiB"    # becomes 0.25 of a 24GiB GPU
+
+[[jobs]]
+name = "probe"
+command = "python3 fake_train.py --device {device} --seconds 5"
+gpu_share = 0.25

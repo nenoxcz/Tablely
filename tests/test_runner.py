@@ -232,3 +232,54 @@ def _alive(pid):
             return f.read().rsplit(")", 1)[1].split()[0] != "Z"
     except OSError:
         return True
+
+
+def test_shared_gpu_jobs_get_memory_limits_in_their_env():
+    GiB = 1024 ** 3
+    spec = JobSpec(name="s", command="x", gpu_memory="6GiB")
+    alloc = Allocation("gpu", ("1",), (0,), gpu_share=0.25)
+    env = build_env({"TF_FORCE_GPU_ALLOW_GROWTH": "false"}, spec, alloc, gpu_total=24 * GiB)
+    assert env["CUDA_VISIBLE_DEVICES"] == "1"
+    assert env["TABLELY_GPU_SHARE"] == "0.25" and env["TABLELY_GPU_MEMORY"] == str(6 * GiB)
+    assert env["XLA_PYTHON_CLIENT_MEM_FRACTION"] == "0.25"
+    assert env["TF_FORCE_GPU_ALLOW_GROWTH"] == "true"
+    assert "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE" not in env
+
+    third = Allocation("gpu", ("0",), (0,), gpu_share=1 / 3)
+    spec = JobSpec(name="s", command="x", gpu_share=1 / 3, env={"XLA_PYTHON_CLIENT_MEM_FRACTION": ".2"})
+    env = build_env({}, spec, third, gpu_total=24 * GiB, mps=True)
+    assert env["XLA_PYTHON_CLIENT_MEM_FRACTION"] == ".2"  # the job's own setting wins
+    assert env["TABLELY_GPU_MEMORY"] == str(8 * GiB)
+    assert env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] == "33"
+    assert env["CUDA_MPS_PINNED_DEVICE_MEM_LIMIT"] == "0=8192MB"
+
+    whole = build_env({"TABLELY_GPU_SHARE": "0.5"}, JobSpec(name="w", command="x"), Allocation("gpu", ("0",), (0,)))
+    assert "TABLELY_GPU_SHARE" not in whole and "XLA_PYTHON_CLIENT_MEM_FRACTION" not in whole
+
+
+def test_small_jobs_run_side_by_side_on_one_gpu(tmp_path):
+    jobs = [
+        JobSpec(name=n, command=report(tmp_path / f"{n}.json", after="time.sleep(0.6)"), gpu_share=0.5)
+        for n in ("a", "b")
+    ]
+    jobs.append(JobSpec(name="whole", command=report(tmp_path / "whole.json"), priority=0.5))
+    runner = make_runner(tmp_path, jobs)
+    assert runner.run() == 0, runner.out.getvalue()
+    a, b, whole = (json.loads((tmp_path / f"{n}.json").read_text()) for n in ("a", "b", "whole"))
+    assert a["CUDA_VISIBLE_DEVICES"] == b["CUDA_VISIBLE_DEVICES"] == "0"
+    assert a["TABLELY_GPU_SHARE"] == b["TABLELY_GPU_SHARE"] == "0.5"
+    assert abs(a["t"] - b["t"]) < 0.5  # both ran at once
+    assert whole["t"] > max(a["t"], b["t"]) + 0.3  # the whole-GPU job waited for both
+    assert "GPU 0 (share 0.5)" in runner.summary()
+
+
+def test_client_reads_its_gpu_share(monkeypatch):
+    from tablely import client
+
+    monkeypatch.setenv("TABLELY_DEVICE", "cuda")
+    monkeypatch.setenv("TABLELY_GPU_SHARE", "0.25")
+    monkeypatch.setenv("TABLELY_GPU_MEMORY", str(6 * 1024 ** 3))
+    assert client.gpu_share() == 0.25 and client.gpu_memory() == 6 * 1024 ** 3
+    monkeypatch.setenv("TABLELY_DEVICE", "cpu")  # fell back to CPU: no GPU share
+    assert client.gpu_share() is None and client.gpu_memory() is None
+    assert client.limit_gpu_memory() is None  # nothing to limit, torch not even imported

@@ -6,9 +6,11 @@ and previewed (``tablely plan``) without running anything.
 One scheduling round:
 
 1. Pending jobs are visited in priority order (ties: submission order).
-   A job gets whole GPUs if it wants them and enough are free; a ``device =
-   "any"`` job that cannot get a GPU runs on CPU instead; a ``device = "gpu"``
-   job waits.
+   A job gets whole GPUs if it wants them and enough are free; a job asking
+   for part of a GPU (``gpu_share`` / ``gpu_memory``) goes to the fullest GPU
+   it still fits on (best fit), so small jobs pack together and whole GPUs
+   stay free for big ones. A ``device = "any"`` job that cannot get a GPU runs
+   on CPU instead; a ``device = "gpu"`` job waits.
 2. Every job must also fit its guaranteed core count (``cpus``).
 3. Strict priority (default): once a job has to wait, lower-priority jobs may
    not take what it is waiting for — free GPUs stay reserved for it and its
@@ -27,13 +29,14 @@ One scheduling round:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .resources import Inventory
+from .resources import Inventory, format_bytes
 from .spec import Device, JobSpec
 
 GPU = "gpu"
 CPU = "cpu"
+EPS = 1e-6  # slack when adding up GPU shares
 
 
 @dataclass(frozen=True)
@@ -41,10 +44,16 @@ class Allocation:
     device: str  # where the job actually runs: "gpu" or "cpu"
     gpus: Tuple[str, ...] = ()
     cpus: Tuple[int, ...] = ()
+    gpu_share: Optional[float] = None  # part of its one GPU, when it shares that GPU with others
 
     @property
     def on_gpu(self) -> bool:
         return self.device == GPU
+
+    @property
+    def gpu_load(self) -> float:
+        """How much of each of its GPUs this job takes (1.0 = all of it)."""
+        return 1.0 if self.gpu_share is None else self.gpu_share
 
 
 @dataclass(frozen=True)
@@ -58,6 +67,7 @@ class Plan:
     started: List[str]  # newly admitted jobs, highest priority first
     waiting: Dict[str, str]  # pending job -> why it is not starting yet
     spare_gpus: List[str] = field(default_factory=list)  # free, and no waiting job wants them
+    gpu_load: Dict[str, float] = field(default_factory=dict)  # GPU -> part in use after this round
 
 
 def plan(
@@ -78,10 +88,10 @@ def plan(
         return (-jobs[name].priority, order[name])
 
     total_cpus = len(inventory.cpus)
-    busy = {gpu for alloc in running.values() for gpu in alloc.gpus}
-    free_gpus = [gpu for gpu in inventory.gpus if gpu not in busy]
-    placed: Dict[str, Tuple[str, Tuple[str, ...]]] = {
-        name: (alloc.device, alloc.gpus) for name, alloc in running.items()
+    used = gpu_load(inventory.gpus, running.values())
+    free_gpus = [gpu for gpu in inventory.gpus if used[gpu] <= EPS]
+    placed: Dict[str, Tuple[str, Tuple[str, ...], Optional[float]]] = {
+        name: (alloc.device, alloc.gpus, alloc.gpu_share) for name, alloc in running.items()
     }
     committed = sum(jobs[name].cpus for name in running)
 
@@ -91,14 +101,14 @@ def plan(
     cpus_held_back = False  # a higher-priority job is waiting for cores
     for name in sorted(pending, key=by_priority):
         spec = jobs[name]
-        gpu_ok = (
-            spec.device is not Device.CPU and not gpus_held_back and spec.gpus <= len(free_gpus)
-        )
-        if spec.device is Device.GPU and not gpu_ok:
+        slot = None
+        if spec.device is not Device.CPU and not gpus_held_back:
+            slot = fit_gpus(spec, inventory, used, free_gpus)
+        if spec.device is Device.GPU and slot is None:
             if gpus_held_back:
                 waiting[name] = "GPUs held for a higher-priority job"
             else:
-                waiting[name] = f"needs {spec.gpus} GPU(s), {len(free_gpus)} free"
+                waiting[name] = _gpu_wait_reason(spec, inventory, used, free_gpus)
             if not policy.backfill:
                 gpus_held_back = True
                 committed += spec.cpus
@@ -112,12 +122,14 @@ def plan(
                 cpus_held_back = True
             continue
 
-        if gpu_ok:
-            taken = tuple(free_gpus[: spec.gpus])
-            del free_gpus[: spec.gpus]
-            placed[name] = (GPU, taken)
+        if slot is not None:
+            taken, share = slot
+            for gpu in taken:
+                used[gpu] += 1.0 if share is None else share
+            free_gpus = [gpu for gpu in free_gpus if used[gpu] <= EPS]
+            placed[name] = (GPU, taken, share)
         else:
-            placed[name] = (CPU, ())
+            placed[name] = (CPU, (), None)
         committed += spec.cpus
         started.append(name)
 
@@ -136,24 +148,73 @@ def plan(
     current = {name: alloc.cpus for name, alloc in running.items()}
     cpu_sets = _pick_cpu_ids(inventory.cpus, active, counts, current)
     allocations = {
-        name: Allocation(device=placed[name][0], gpus=placed[name][1], cpus=cpu_sets[name])
+        name: Allocation(device=placed[name][0], gpus=placed[name][1], cpus=cpu_sets[name],
+                         gpu_share=placed[name][2])
         for name in active
     }
     spare = [] if gpu_wanted else list(free_gpus)
-    return Plan(allocations=allocations, started=started, waiting=waiting, spare_gpus=spare)
+    return Plan(allocations=allocations, started=started, waiting=waiting, spare_gpus=spare,
+                gpu_load=gpu_load(inventory.gpus, allocations.values()))
+
+
+def gpu_load(gpus: Sequence[str], allocations: Iterable[Allocation]) -> Dict[str, float]:
+    """How much of each GPU in ``gpus`` the given allocations take (0 = free, 1 = full)."""
+    load = {gpu: 0.0 for gpu in gpus}
+    for alloc in allocations:
+        for gpu in alloc.gpus:
+            if gpu in load:
+                load[gpu] += alloc.gpu_load
+    return load
+
+
+def fit_gpus(
+    spec: JobSpec, inventory: Inventory, used: Mapping[str, float], free_gpus: Sequence[str]
+) -> Optional[Tuple[Tuple[str, ...], Optional[float]]]:
+    """GPUs for ``spec`` right now as ``(gpus, share)``, or None if it does not fit.
+
+    Whole-GPU jobs take free GPUs in order. A shared job takes the GPU it
+    leaves the least room on (best fit), so partly used GPUs fill up first.
+    """
+    if not spec.shared:
+        return (tuple(free_gpus[: spec.gpus]), None) if spec.gpus <= len(free_gpus) else None
+    best: Optional[Tuple[float, str, float]] = None
+    for gpu in inventory.gpus:
+        share = spec.share_on(inventory.memory_of(gpu))
+        if share is None:
+            continue
+        room = 1.0 - used[gpu] - share
+        if room >= -EPS and (best is None or room < best[0] - EPS):
+            best = (room, gpu, share)
+    return None if best is None else ((best[1],), best[2])
+
+
+def _gpu_wait_reason(
+    spec: JobSpec, inventory: Inventory, used: Mapping[str, float], free_gpus: Sequence[str]
+) -> str:
+    if not spec.shared:
+        return f"needs {spec.gpus} GPU(s), {len(free_gpus)} free"
+    if spec.gpu_share is not None:
+        most = max((1.0 - used[gpu] for gpu in inventory.gpus), default=0.0)
+        return f"needs {spec.gpu_share:g} of a GPU, at most {max(most, 0.0):.2g} free on one"
+    sizes = [(gpu, inventory.memory_of(gpu)) for gpu in inventory.gpus]
+    room = [mem * max(1.0 - used[gpu], 0.0) for gpu, mem in sizes if mem]
+    if not room:
+        return f"needs {format_bytes(spec.gpu_memory)} of GPU memory; GPU memory sizes are unknown"
+    return f"needs {format_bytes(spec.gpu_memory)} of GPU memory, at most {format_bytes(int(max(room)))} free on one"
 
 
 def _grow_gpu_sets(
     jobs: Mapping[str, JobSpec],
     started: Sequence[str],
-    placed: Dict[str, Tuple[str, Tuple[str, ...]]],
+    placed: Dict[str, Tuple[str, Tuple[str, ...], Optional[float]]],
     free_gpus: List[str],
     total_gpus: int,
 ) -> None:
     """Hand GPUs nobody waits for to starting jobs that accept more, by priority."""
     growable = [
         name for name in started
-        if placed[name][0] == GPU and jobs[name].gpu_cap(total_gpus) > len(placed[name][1])
+        if placed[name][0] == GPU and placed[name][2] is None
+        and jobs[name].gpu_cap(total_gpus) > len(placed[name][1])
     ]
     if not growable:
         return
@@ -165,7 +226,7 @@ def _grow_gpu_sets(
     for name, n, count in zip(growable, have, counts):
         extra = tuple(free_gpus[: count - n])
         del free_gpus[: count - n]
-        placed[name] = (GPU, placed[name][1] + extra)
+        placed[name] = (GPU, placed[name][1] + extra, None)
 
 
 def share_cpus(total: int, demands: Sequence[Tuple[int, Optional[int], float]]) -> List[int]:
@@ -240,4 +301,18 @@ def check_feasible(inventory: Inventory, jobs: Sequence[JobSpec]) -> Tuple[List[
                 f"{spec.name}: wants {spec.gpus} GPU(s) but only {len(inventory.gpus)} exist; "
                 "it will always run on CPU"
             )
+        elif spec.gpu_memory is not None and inventory.gpus:
+            sizes = [inventory.memory_of(gpu) for gpu in inventory.gpus]
+            if not any(sizes):
+                problem = (f"asks for {format_bytes(spec.gpu_memory)} of GPU memory but the GPUs' "
+                           "memory size is unknown; set [resources] gpu_memory (or --gpu-memory)")
+            elif spec.gpu_memory > max(m for m in sizes if m) * (1 + EPS):
+                problem = (f"asks for {format_bytes(spec.gpu_memory)} of GPU memory but the largest "
+                           f"GPU has {format_bytes(max(m for m in sizes if m))}")
+            else:
+                continue
+            if spec.device is Device.GPU:
+                errors.append(f"{spec.name}: {problem}")
+            else:
+                warnings.append(f"{spec.name}: {problem}; it will always run on CPU")
     return errors, warnings

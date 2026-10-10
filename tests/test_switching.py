@@ -161,3 +161,38 @@ def test_endless_switching_is_capped(tmp_path):
     assert runner.run() == 1
     assert len(runs(marks)) == 3
     assert "more than 2 times" in runner.summary()
+
+
+def test_shared_cpu_job_moves_into_room_left_on_a_gpu(tmp_path):
+    marks = tmp_path / "marks"
+    jobs = [
+        JobSpec(name="stays", command=py("import time; time.sleep(2.5)"), gpu_share=0.5, priority=9),
+        JobSpec(name="leaves", command=py("import time; time.sleep(0.4)"), gpu_share=0.5, priority=9),
+        JobSpec(name="flex", command=switching_job(marks), device="any", gpu_share=0.5, switchable=True),
+    ]
+    runner = make(tmp_path, jobs)
+    assert runner.run() == 0, runner.out.getvalue()
+    # GPU 0 never became fully free ("stays" ran throughout), yet flex moved into the half "leaves" left.
+    assert runs(marks) == [{"device": "cpu", "restarts": 0}, {"device": "cuda", "restarts": 1}]
+    assert "room on GPU 0 and nobody waiting for it" in runner.out.getvalue()
+    assert runner.records["flex"].allocation.gpu_share == 0.5
+
+
+def test_jobs_sharing_a_gpu_are_not_pushed_to_cpu(tmp_path):
+    marks = tmp_path / "marks"
+    ledger = Ledger(tmp_path / "home")
+    runner = make(tmp_path, [JobSpec(name="flex", command=switching_job(marks, first="ignore", limit=3),
+                                     device="any", gpu_share=0.5, switchable=True)], ledger=ledger)
+    runner._register()
+    tick_until(runner, lambda: runner.records["flex"].state is JobState.RUNNING)
+    assert runner.records["flex"].allocation.gpu_share == 0.5
+
+    other_agent_job(ledger, state="pending", priority=9)  # wants the whole GPU
+    for _ in range(10):
+        runner._tick()
+        time.sleep(0.02)
+    assert runner.records["flex"].switch_requested is None  # moving it would not free the GPU
+    with ledger.locked() as board:
+        assert board.job("r0.big")["wait_reason"] == "needs 1 GPU(s), 0 free"
+    runner._stop_all()
+    runner._unregister()

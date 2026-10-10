@@ -18,10 +18,10 @@ from typing import List, Optional, Sequence, Union
 from . import __version__, _fmt, handoff
 from .board_view import render_brief, render_history
 from .config import Config, ConfigError, load_config
-from .ledger import Board, Ledger, default_agent, make_event
+from .ledger import Board, Ledger, default_agent, make_event, pool_inventory
 from .planner import Policy, check_feasible, plan
 from .progress import run_ai, save_prompt
-from .resources import Inventory, build_inventory
+from .resources import build_inventory
 from .runner import Runner
 from .spec import format_priority
 
@@ -48,6 +48,8 @@ def _parser() -> argparse.ArgumentParser:
     resources.add_argument("--cpus", type=_cpu_arg, help="core count (e.g. 12) or core list (e.g. 0-7,16-23)")
     resources.add_argument("--gpus", type=_gpu_arg, help="GPU count (e.g. 2) or id list (e.g. 0,2)")
     resources.add_argument("--reserve-cpus", type=int, help="leave the lowest N cores to the OS")
+    resources.add_argument("--gpu-memory", metavar="SIZE",
+                           help="memory of each GPU, e.g. 24GiB, when nvidia-smi cannot tell (for gpu_memory jobs)")
 
     shared = argparse.ArgumentParser(add_help=False)
     shared.add_argument("--home", help="state shared by all agents on this machine (default: $TABLELY_HOME or ~/.tablely)")
@@ -70,6 +72,8 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--log-dir", help="where job output goes (default: from the job file)")
     p.add_argument("--agent", help="who is running this (default: $TABLELY_AGENT or the login name)")
     p.add_argument("--task", help="what this run is for (default: 'task' in the job file)")
+    p.add_argument("--mps", action="store_true", default=None,
+                   help="an NVIDIA MPS daemon runs here: also have the driver enforce shared-GPU limits")
     p.set_defaults(func=_cmd_run)
 
     p = sub.add_parser("status", parents=[shared], help="progress of everyone's work on this machine")
@@ -137,7 +141,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def _cmd_resources(args: argparse.Namespace) -> int:
     try:
-        inventory = build_inventory(args.cpus, args.gpus, args.reserve_cpus or 0)
+        inventory = build_inventory(args.cpus, args.gpus, args.reserve_cpus or 0, gpu_memory=args.gpu_memory)
     except ValueError as exc:
         raise ConfigError(str(exc)) from None
     print(inventory.describe())
@@ -148,12 +152,12 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     config = _load(args)
     # With explicit --cpus/--gpus/--reserve-cpus this is a what-if for some other
     # machine; otherwise plan around whatever other agents are running here.
-    what_if = any(v is not None for v in (args.cpus, args.gpus, args.reserve_cpus))
+    what_if = any(v is not None for v in (args.cpus, args.gpus, args.reserve_cpus, args.gpu_memory))
     board = None if what_if else Board(Ledger(args.home).snapshot())
     sharing = board is not None and bool(board.jobs) and board.data.get("pool")
     if sharing:
         pool = board.data["pool"]
-        inventory = Inventory(cpus=tuple(pool["cpus"]), gpus=tuple(pool["gpus"]))
+        inventory = pool_inventory(pool)
         policy = Policy(backfill=pool["backfill"])
     else:
         inventory = config.inventory(simulate=True)  # a preview may describe a bigger server
@@ -182,13 +186,16 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     rows = []
     for key, spec in sorted(ours.items(), key=lambda kv: -kv[1].priority):  # stable: ties keep file order
         alloc = decision.allocations.get(key)
-        wants = spec.device.value + (f" x{spec.gpus}" if spec.gpus else "")
+        wants = f"{spec.device.value} {spec.describe_gpu_need()}".strip()
         status = "start" if alloc else f"wait: {decision.waiting[key]}"
         rows.append(
             [spec.name, format_priority(spec.priority), wants, _fmt.placement(alloc), _fmt.cores(alloc), status]
         )
     print()
     print(_fmt.table(["JOB", "PRIO", "WANTS", "PLACED ON", "CORES", "STATUS"], rows))
+    if any(alloc.gpu_share is not None for alloc in decision.allocations.values()):
+        print()
+        print("gpu use: " + " · ".join(f"{gpu} {_fmt.percent(load).strip()}" for gpu, load in decision.gpu_load.items()))
     if sharing:
         rows = []
         for key, job in board.jobs.items():
@@ -223,6 +230,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             task=args.task or config.task,
             switch_grace=config.switch_grace,
             max_switches=config.max_switches,
+            mps=config.mps,
         )
     except ValueError as exc:
         raise ConfigError(str(exc)) from None
@@ -389,6 +397,10 @@ def _load(args: argparse.Namespace) -> Config:
         overrides["gpus"] = args.gpus
     if args.reserve_cpus is not None:
         overrides["reserve_cpus"] = args.reserve_cpus
+    if args.gpu_memory is not None:
+        overrides["gpu_memory"] = args.gpu_memory
+    if getattr(args, "mps", None):
+        overrides["mps"] = True
     if args.backfill:
         overrides["policy"] = Policy(backfill=True)
     return dataclasses.replace(config, **overrides)

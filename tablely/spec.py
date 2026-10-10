@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence, Union
 
+from .resources import format_bytes, parse_bytes
+
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -30,6 +32,11 @@ class JobSpec:
     ``"all"``) it may be handed more at launch when no one else is waiting for
     a GPU. ``switchable`` jobs can checkpoint and be restarted on another
     device when Tablely asks (see ``client.switch_requested``).
+
+    Small jobs can share one GPU: ``gpu_share`` asks for a fraction of a GPU
+    (``0.5`` = half) and ``gpu_memory`` for an amount of GPU memory
+    (``"10GiB"``), which Tablely turns into the fraction of whichever GPU the
+    job lands on. Shared jobs are packed onto the fullest GPU they still fit.
     """
 
     name: str
@@ -45,6 +52,8 @@ class JobSpec:
     task: Optional[str] = None  # what this job is for, shown to other agents
     max_gpus: Optional[Union[int, str]] = None  # grow to this many GPUs at launch if free; "all" = no cap
     switchable: bool = False  # supports checkpoint + restart on another device
+    gpu_share: Optional[float] = None  # fraction of one GPU (0 < x < 1); others may use the rest
+    gpu_memory: Optional[Union[int, str]] = None  # GPU memory to set aside instead, e.g. "10GiB"
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.match(self.name):
@@ -84,6 +93,8 @@ class JobSpec:
         if self.device is Device.CPU:
             object.__setattr__(self, "gpus", 0)
             object.__setattr__(self, "max_gpus", None)
+            object.__setattr__(self, "gpu_share", None)
+            object.__setattr__(self, "gpu_memory", None)
         elif self.gpus < 1:
             raise ValueError(f"{self.name}: gpus must be at least 1 for device {self.device.value!r}")
         if self.max_gpus is not None and self.max_gpus != "all":
@@ -91,11 +102,59 @@ class JobSpec:
                 raise ValueError(f'{self.name}: max_gpus must be an integer or "all"')
             if self.max_gpus < self.gpus:
                 raise ValueError(f"{self.name}: max_gpus ({self.max_gpus}) is below gpus ({self.gpus})")
+        self._check_sharing()
         if not isinstance(self.switchable, bool):
             raise ValueError(f"{self.name}: switchable must be true or false")
         object.__setattr__(self, "env", {str(k): str(v) for k, v in dict(self.env).items()})
         if self.task is not None and not isinstance(self.task, str):
             raise ValueError(f"{self.name}: task must be a string")
+
+    def _check_sharing(self) -> None:
+        if self.gpu_share is not None:
+            if not _is_number(self.gpu_share) or not 0 < self.gpu_share < 1:
+                raise ValueError(
+                    f"{self.name}: gpu_share must be between 0 and 1, e.g. 0.5 for half a GPU "
+                    f"(got {self.gpu_share!r}); leave it out to use whole GPUs"
+                )
+            object.__setattr__(self, "gpu_share", float(self.gpu_share))
+        if self.gpu_memory is not None:
+            try:
+                object.__setattr__(self, "gpu_memory", parse_bytes(self.gpu_memory))
+            except ValueError as exc:
+                raise ValueError(f"{self.name}: gpu_memory: {exc}") from None
+        if not self.shared:
+            return
+        if self.gpu_share is not None and self.gpu_memory is not None:
+            raise ValueError(f"{self.name}: set gpu_share or gpu_memory, not both")
+        if self.gpus != 1:
+            raise ValueError(f"{self.name}: a job sharing a GPU uses exactly one (gpus = 1)")
+        if self.max_gpus is not None:
+            raise ValueError(f"{self.name}: max_gpus cannot be combined with gpu_share/gpu_memory")
+
+    @property
+    def shared(self) -> bool:
+        """Whether this job asks for part of a GPU rather than whole GPUs."""
+        return self.gpu_share is not None or self.gpu_memory is not None
+
+    def share_on(self, gpu_memory: Optional[int]) -> Optional[float]:
+        """Fraction of a GPU with ``gpu_memory`` bytes this job takes (1.0 for whole-GPU jobs).
+
+        None when the job asks for memory but the GPU's size is unknown; above
+        1.0 when the GPU is too small.
+        """
+        if self.gpu_share is not None:
+            return self.gpu_share
+        if self.gpu_memory is not None:
+            return self.gpu_memory / gpu_memory if gpu_memory else None
+        return 1.0
+
+    def describe_gpu_need(self) -> str:
+        """``"x2"`` (GPUs), ``"x0.5"`` (of one GPU), ``"10GiB"`` (of GPU memory), or ``""`` on CPU."""
+        if self.gpu_memory is not None:
+            return format_bytes(self.gpu_memory)
+        if self.gpu_share is not None:
+            return f"x{self.gpu_share:g}"
+        return f"x{self.gpus}" if self.gpus else ""
 
     def gpu_cap(self, total_gpus: int) -> int:
         """Most GPUs this job can use on a machine with ``total_gpus``."""

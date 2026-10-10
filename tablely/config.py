@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, List, Mapping, Optional, Union
 
 from .planner import Policy
-from .resources import CpuSetting, GpuSetting, Inventory, build_inventory
+from .resources import CpuSetting, GpuSetting, Inventory, build_inventory, parse_bytes
 from .spec import JobSpec
 
 if sys.version_info >= (3, 11):
@@ -18,10 +18,10 @@ else:  # pragma: no cover
     import tomli as tomllib
 
 _TOP_KEYS = {"resources", "jobs", "log_dir", "backfill", "task", "switch_grace", "max_switches"}
-_RESOURCE_KEYS = {"cpus", "gpus", "reserve_cpus"}
+_RESOURCE_KEYS = {"cpus", "gpus", "reserve_cpus", "gpu_memory", "mps"}
 _JOB_KEYS = {
     "name", "command", "priority", "device", "gpus", "max_gpus", "cpus", "max_cpus",
-    "env", "cwd", "shell", "task", "switchable",
+    "env", "cwd", "shell", "task", "switchable", "gpu_share", "gpu_memory",
 }
 
 
@@ -40,10 +40,13 @@ class Config:
     task: Optional[str] = None  # what this batch is for; jobs without their own task inherit it
     switch_grace: float = 60.0  # seconds a switchable job runs before it may be asked to move
     max_switches: int = 5  # device switches per job before it is no longer asked
+    gpu_memory: Union[None, int, str] = None  # memory of each GPU, when nvidia-smi cannot tell
+    mps: bool = False  # an NVIDIA MPS daemon runs: let the driver enforce GPU shares too
 
     def inventory(self, simulate: bool = False) -> Inventory:
         try:
-            return build_inventory(self.cpus, self.gpus, self.reserve_cpus, simulate=simulate)
+            return build_inventory(self.cpus, self.gpus, self.reserve_cpus, simulate=simulate,
+                                   gpu_memory=self.gpu_memory)
         except (TypeError, ValueError) as exc:
             raise ConfigError(f"resources: {exc}") from None
 
@@ -103,6 +106,16 @@ def parse_config(data: Any, base_dir: Union[str, Path] = ".") -> Config:
     if isinstance(max_switches, bool) or not isinstance(max_switches, int) or max_switches < 0:
         raise ConfigError("max_switches must be a non-negative integer")
 
+    gpu_memory = resources.get("gpu_memory")
+    if gpu_memory is not None:
+        try:
+            parse_bytes(gpu_memory)
+        except ValueError as exc:
+            raise ConfigError(f"[resources] gpu_memory: {exc}") from None
+    mps = resources.get("mps", False)
+    if not isinstance(mps, bool):
+        raise ConfigError("[resources] mps must be true or false")
+
     log_dir = Path(str(data.get("log_dir", "tablely-logs")))
     reserve = resources.get("reserve_cpus", 0)
     if isinstance(reserve, bool) or not isinstance(reserve, int):
@@ -117,6 +130,8 @@ def parse_config(data: Any, base_dir: Union[str, Path] = ".") -> Config:
         task=task,
         switch_grace=float(switch_grace),
         max_switches=max_switches,
+        gpu_memory=gpu_memory,
+        mps=mps,
     )
 
 

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass
-from typing import Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
 
 CpuSetting = Union[None, int, str, Sequence[int]]
 GpuSetting = Union[None, int, str, Sequence[str]]
@@ -13,17 +14,64 @@ GpuSetting = Union[None, int, str, Sequence[str]]
 
 @dataclass(frozen=True)
 class Inventory:
-    """The resources Tablely may hand out: logical CPU ids and GPU ids."""
+    """The resources Tablely may hand out: logical CPU ids and GPU ids.
+
+    ``gpu_memory`` lines up with ``gpus`` (bytes, or None when unknown); it is
+    what ``gpu_memory`` requests of shared-GPU jobs are measured against.
+    """
 
     cpus: Tuple[int, ...]
     gpus: Tuple[str, ...]
+    gpu_memory: Tuple[Optional[int], ...] = ()
+
+    def memory_of(self, gpu: str) -> Optional[int]:
+        try:
+            return self.gpu_memory[self.gpus.index(gpu)]
+        except (ValueError, IndexError):
+            return None
+
+    def gpu_labels(self) -> List[str]:
+        """GPU ids with their memory when known, e.g. ``["0 (24GiB)", "1"]``."""
+        labels = []
+        for gpu in self.gpus:
+            memory = self.memory_of(gpu)
+            labels.append(f"{gpu} ({format_bytes(memory)})" if memory else gpu)
+        return labels
 
     def describe(self) -> str:
-        gpus = ",".join(self.gpus) if self.gpus else "none"
         return (
             f"{len(self.cpus)} CPU core(s) [{format_cpu_list(self.cpus)}], "
-            f"{len(self.gpus)} GPU(s) [{gpus}]"
+            f"{len(self.gpus)} GPU(s) [{', '.join(self.gpu_labels()) or 'none'}]"
         )
+
+
+_SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([KMGT]?)(?:i?B)?\s*$", re.IGNORECASE)
+
+
+def parse_bytes(value: Union[int, str]) -> int:
+    """``"10GiB"``, ``"10G"``, ``"10GB"`` (all 1024-based), ``"512MiB"`` or a plain byte count."""
+    if isinstance(value, bool):
+        raise ValueError(f"not a memory size: {value!r}")
+    if isinstance(value, int):
+        if value <= 0:
+            raise ValueError("memory size must be positive")
+        return value
+    match = _SIZE.match(str(value))
+    if not match:
+        raise ValueError(f"not a memory size: {value!r} (use e.g. \"10GiB\" or \"512MiB\")")
+    number = float(match.group(1)) * 1024 ** "_KMGT".index(match.group(2).upper() or "_")
+    if number <= 0:
+        raise ValueError("memory size must be positive")
+    return int(number)
+
+
+def format_bytes(value: Optional[int]) -> str:
+    if value is None:
+        return "?"
+    for unit, size in (("TiB", 1024 ** 4), ("GiB", 1024 ** 3), ("MiB", 1024 ** 2), ("KiB", 1024)):
+        if value >= size:
+            return f"{value / size:.3g}{unit}"
+    return f"{value}B"
 
 
 def parse_cpu_list(text: str) -> List[int]:
@@ -72,11 +120,17 @@ def detect_cpus() -> List[int]:
 
 
 def detect_gpus(env: Optional[Mapping[str, str]] = None) -> List[str]:
-    """GPU ids usable by jobs.
+    """GPU ids usable by jobs (see :func:`detect_gpu_devices`)."""
+    return [gpu for gpu, _ in detect_gpu_devices(env)]
+
+
+def detect_gpu_devices(env: Optional[Mapping[str, str]] = None) -> List[Tuple[str, Optional[int]]]:
+    """``(id, memory in bytes or None)`` for every GPU jobs may use.
 
     If ``CUDA_VISIBLE_DEVICES`` is already set for Tablely itself, only those
     devices are used. Otherwise ``nvidia-smi`` is asked; no NVIDIA driver means
-    no GPUs.
+    no GPUs. A GPU split with MIG is replaced by its MIG instances (ids
+    ``MIG-<uuid>``), each scheduled like a GPU of its own.
     """
     env = os.environ if env is None else env
     visible = env.get("CUDA_VISIBLE_DEVICES")
@@ -87,18 +141,54 @@ def detect_gpus(env: Optional[Mapping[str, str]] = None) -> List[str]:
             if not item or item.startswith("-"):  # CUDA stops at the first invalid id
                 break
             gpus.append(item)
-        return gpus
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=True,
-        )
-    except (OSError, subprocess.SubprocessError):
+        memory = _nvidia_smi_memory() if gpus else {}
+        return [(gpu, memory.get(gpu)) for gpu in gpus]
+    listing = _nvidia_smi("-L")
+    if listing is None:
         return []
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    return parse_gpu_listing(listing, _nvidia_smi_memory())
+
+
+def parse_gpu_listing(listing: str, memory: Mapping[str, int]) -> List[Tuple[str, Optional[int]]]:
+    """Read ``nvidia-smi -L``: physical GPUs by index, MIG instances by UUID with their profile's memory."""
+    devices: List[Tuple[str, Optional[int]]] = []
+    current: Optional[str] = None
+    migs: List[Tuple[str, Optional[int]]] = []
+
+    def flush() -> None:
+        if current is not None:
+            devices.extend(migs or [(current, memory.get(current))])
+
+    for line in listing.splitlines():
+        gpu = re.match(r"^GPU (\d+):", line)
+        mig = re.match(r"^\s+MIG\s+(\S+)\s+Device\s+\d+:\s*\(UUID:\s*(MIG-[^)\s]+)\)", line)
+        if gpu:
+            flush()
+            current, migs = gpu.group(1), []
+        elif mig and current is not None:
+            size = re.search(r"(\d+)gb", mig.group(1), re.IGNORECASE)  # profile like "3g.40gb"
+            migs.append((mig.group(2), int(size.group(1)) * 1024 ** 3 if size else None))
+    flush()
+    return devices
+
+
+def _nvidia_smi(*args: str) -> Optional[str]:
+    try:
+        result = subprocess.run(["nvidia-smi", *args], capture_output=True, text=True, timeout=15, check=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout
+
+
+def _nvidia_smi_memory() -> Dict[str, int]:
+    """Total memory per GPU index, in bytes."""
+    out = _nvidia_smi("--query-gpu=index,memory.total", "--format=csv,noheader,nounits") or ""
+    memory = {}
+    for line in out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            memory[parts[0]] = int(parts[1]) * 1024 ** 2  # reported in MiB
+    return memory
 
 
 def build_inventory(
@@ -106,6 +196,7 @@ def build_inventory(
     gpus: GpuSetting = None,
     reserve_cpus: int = 0,
     simulate: bool = False,
+    gpu_memory: Union[None, int, str] = None,
 ) -> Inventory:
     """Build the inventory, optionally narrowing what was detected.
 
@@ -117,6 +208,8 @@ def build_inventory(
     ``reserve_cpus``: keep the lowest N cores free for the OS and Tablely.
     ``simulate``: allow cores this machine does not have (for dry-run previews
     of a bigger server); never use it for real runs.
+    ``gpu_memory``: memory of each GPU (e.g. ``"24GiB"``), when it cannot be
+    detected or should be overridden.
     """
     detected = detect_cpus()
     if cpus is None:
@@ -147,18 +240,24 @@ def build_inventory(
         raise ValueError(f"reserve_cpus = {reserve_cpus} leaves no cores for jobs")
     cpu_ids = cpu_ids[reserve_cpus:]
 
+    found = dict(detect_gpu_devices()) if gpus is None or isinstance(gpus, int) else {}
     if gpus is None:
-        gpu_ids = detect_gpus()
+        gpu_ids = list(found)
     elif isinstance(gpus, int) and not isinstance(gpus, bool):
         if gpus < 0:
             raise ValueError("gpus must not be negative")
-        found = detect_gpus()
-        gpu_ids = found[:gpus] if len(found) >= gpus else [str(i) for i in range(gpus)]
+        gpu_ids = list(found)[:gpus] if len(found) >= gpus else [str(i) for i in range(gpus)]
     elif isinstance(gpus, str):
         gpu_ids = [g.strip() for g in gpus.split(",") if g.strip()]
     else:
         gpu_ids = [str(g) for g in gpus]
     if len(set(gpu_ids)) != len(gpu_ids):
         raise ValueError(f"duplicate GPU ids in {gpu_ids}")
+    if gpu_memory is not None:
+        memory = [parse_bytes(gpu_memory)] * len(gpu_ids)
+    else:
+        if gpu_ids and not found:
+            found = dict(detect_gpu_devices())
+        memory = [found.get(gpu) for gpu in gpu_ids]
 
-    return Inventory(cpus=tuple(cpu_ids), gpus=tuple(gpu_ids))
+    return Inventory(cpus=tuple(cpu_ids), gpus=tuple(gpu_ids), gpu_memory=tuple(memory))

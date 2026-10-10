@@ -10,6 +10,10 @@ make the common cases one-liners::
     client.sync_torch_threads()       # call now and then: follows core changes
     client.progress(f"epoch {e}/{n}, val acc {acc:.3f}")   # shown in `tablely status`
 
+Sharing a GPU (jobs with ``gpu_share`` or ``gpu_memory``)::
+
+    client.limit_gpu_memory()         # PyTorch: stay within this job's part of the GPU
+
 Moving between CPU and GPU (jobs marked ``switchable = true``)::
 
     start = load_checkpoint() if client.restarts() else 0
@@ -45,6 +49,42 @@ def gpus() -> List[str]:
     """GPU ids assigned to this job (empty on CPU)."""
     value = os.environ.get("TABLELY_GPUS", "")
     return [g for g in value.split(",") if g]
+
+
+def gpu_share() -> Optional[float]:
+    """Part of its GPU this job was given (e.g. ``0.5``), or None when it has whole GPUs."""
+    value = os.environ.get("TABLELY_GPU_SHARE")
+    try:
+        return float(value) if value and device() == "cuda" else None
+    except ValueError:
+        return None
+
+
+def gpu_memory() -> Optional[int]:
+    """GPU memory this job may use, in bytes, when it shares a GPU and the size is known."""
+    value = os.environ.get("TABLELY_GPU_MEMORY")
+    return int(value) if value and value.isdigit() and gpu_share() is not None else None
+
+
+def limit_gpu_memory() -> Optional[float]:
+    """Keep PyTorch within this job's share of the GPU; call once before training.
+
+    Jobs sharing a GPU are trusted to stay within their part: JAX and
+    TensorFlow are configured through environment variables, PyTorch needs
+    this call (``torch.cuda.set_per_process_memory_fraction``). Allocations
+    beyond the share then fail with an out-of-memory error in this job
+    instead of crashing its neighbours. Does nothing for whole-GPU jobs and
+    returns the fraction applied (or None).
+    """
+    share = gpu_share()
+    if share is None:
+        return None
+    import torch
+
+    if not torch.cuda.is_available():
+        return None
+    torch.cuda.set_per_process_memory_fraction(share, 0)
+    return share
 
 
 def num_cpus() -> int:

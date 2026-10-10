@@ -256,3 +256,97 @@ def test_max_gpus_validation():
     with pytest.raises(ValueError, match="max_gpus"):
         job("x", device="gpu", max_gpus="many")
     assert job("c", device="cpu", max_gpus=4).max_gpus is None
+
+
+# -- sharing one GPU ----------------------------------------------------------
+
+GiB = 1024 ** 3
+
+
+def mem_inv(*sizes, cpus=8):
+    return Inventory(cpus=tuple(range(cpus)), gpus=tuple(str(i) for i in range(len(sizes))),
+                     gpu_memory=tuple(sizes))
+
+
+def test_small_jobs_share_one_gpu_and_leave_the_other_free():
+    specs = jobs(job("a", gpu_share=0.5), job("b", gpu_share=0.25), job("c", gpu_share=0.25))
+    p = first_round(inv(gpus=2), specs)
+    assert [p.allocations[n].gpus for n in "abc"] == [("0",)] * 3
+    assert [p.allocations[n].gpu_share for n in "abc"] == [0.5, 0.25, 0.25]
+    assert p.gpu_load == {"0": 1.0, "1": 0.0}
+    assert p.spare_gpus == ["1"]
+
+
+def test_shared_jobs_pack_onto_the_fullest_gpu_they_fit():
+    running = {
+        "half": Allocation("gpu", ("0",), (0,), gpu_share=0.5),
+        "most": Allocation("gpu", ("1",), (1,), gpu_share=0.75),
+    }
+    specs = jobs(job("half", gpu_share=0.5), job("most", gpu_share=0.75), job("q", gpu_share=0.25),
+                 job("h", gpu_share=0.5))
+    p = plan(inv(gpus=3), specs, running, ["q", "h"])
+    assert p.allocations["q"].gpus == ("1",)  # fills GPU 1 exactly
+    assert p.allocations["h"].gpus == ("0",)  # then GPU 0; GPU 2 stays whole
+    assert p.spare_gpus == ["2"]
+
+
+def test_whole_gpu_jobs_skip_partly_used_gpus():
+    running = {"small": Allocation("gpu", ("0",), (0,), gpu_share=0.25)}
+    specs = jobs(job("small", gpu_share=0.25), job("big", gpus=2))
+    p = plan(inv(gpus=2), specs, running, ["big"])
+    assert p.waiting["big"] == "needs 2 GPU(s), 1 free"
+    p = plan(inv(gpus=3), specs, running, ["big"])
+    assert p.allocations["big"].gpus == ("1", "2")
+
+
+def test_gpu_memory_requests_become_shares_of_the_gpu_they_land_on():
+    specs = jobs(job("a", gpu_memory="10GiB"), job("b", gpu_memory="12GiB"), job("c", gpu_memory="4GiB"))
+    p = first_round(mem_inv(80 * GiB, 24 * GiB), specs)
+    # Best fit: the 24GiB card fills up first, the 80GiB card stays free for big jobs.
+    assert p.allocations["a"].gpus == ("1",) and p.allocations["b"].gpus == ("1",)
+    assert p.allocations["a"].gpu_share == pytest.approx(10 / 24)
+    assert p.allocations["c"].gpus == ("0",) and p.allocations["c"].gpu_share == pytest.approx(4 / 80)
+
+
+def test_shared_job_waits_when_no_gpu_has_room():
+    running = {"x": Allocation("gpu", ("0",), (0,), gpu_share=0.75)}
+    specs = jobs(job("x", gpu_share=0.75), job("y", gpu_share=0.5), job("z", gpu_memory="20GiB"))
+    p = plan(mem_inv(24 * GiB), specs, running, ["y", "z"], Policy(backfill=True))
+    assert p.waiting["y"] == "needs 0.5 of a GPU, at most 0.25 free on one"
+    assert p.waiting["z"] == "needs 20GiB of GPU memory, at most 6GiB free on one"
+
+
+def test_shared_any_job_falls_back_to_cpu_and_strict_priority_holds_gpus():
+    running = {"x": Allocation("gpu", ("0",), (0,), gpu_share=0.75)}
+    specs = jobs(job("x", gpu_share=0.75), job("top", priority=5, gpu_share=0.5),
+                 job("flex", device="any", gpu_share=0.25), job("small", gpu_share=0.25))
+    p = plan(inv(gpus=1), specs, running, ["top", "flex", "small"])
+    assert "top" in p.waiting
+    assert p.allocations["flex"].device == "cpu"  # the 0.25 left is held for "top"
+    assert p.waiting["small"] == "GPUs held for a higher-priority job"
+
+
+def test_shared_jobs_never_grow_onto_spare_gpus():
+    specs = jobs(job("s", gpu_share=0.5), job("e", max_gpus="all"))
+    p = first_round(inv(gpus=3), specs)
+    assert p.allocations["s"].gpus == ("0",) and p.allocations["e"].gpus == ("1", "2")
+
+
+def test_gpu_sharing_validation():
+    for bad in ({"gpu_share": 0}, {"gpu_share": 1}, {"gpu_share": "half"}, {"gpu_memory": "lots"},
+                {"gpu_share": 0.5, "gpu_memory": "1GiB"}, {"gpu_share": 0.5, "gpus": 2},
+                {"gpu_share": 0.5, "max_gpus": 2}):
+        with pytest.raises(ValueError):
+            job("x", **bad)
+    assert job("x", gpu_memory="1GiB").gpu_memory == GiB
+    assert job("c", device="cpu", gpu_share=0.5).shared is False
+
+
+def test_check_feasible_needs_gpu_memory_sizes_for_memory_requests():
+    errors, _ = check_feasible(inv(gpus=1), [job("m", gpu_memory="8GiB")])
+    assert "memory size is unknown" in errors[0]
+    errors, _ = check_feasible(mem_inv(24 * GiB), [job("m", gpu_memory="40GiB")])
+    assert "largest GPU has 24GiB" in errors[0]
+    errors, warnings = check_feasible(mem_inv(24 * GiB), [job("m", device="any", gpu_memory="40GiB")])
+    assert not errors and "always run on CPU" in warnings[0]
+    assert check_feasible(mem_inv(24 * GiB), [job("m", gpu_memory="24GiB")]) == ([], [])

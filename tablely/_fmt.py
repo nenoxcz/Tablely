@@ -70,9 +70,17 @@ def table(headers: Sequence[str], rows: Sequence[Sequence[str]], indent: str = "
 
 
 def placement(alloc: Optional[Allocation]) -> str:
+    """``GPU 0,1``, ``GPU 0 (share 0.5)`` for part of a shared GPU, or ``CPU``."""
     if alloc is None:
         return "-"
-    return f"GPU {','.join(alloc.gpus)}" if alloc.on_gpu else "CPU"
+    if not alloc.on_gpu:
+        return "CPU"
+    return gpu_placement(alloc.gpus, alloc.gpu_share)
+
+
+def gpu_placement(gpus: Sequence[str], share: Optional[float]) -> str:
+    where = f"GPU {','.join(gpus)}"
+    return where if share is None else f"{where} (share {share:.2g})"
 
 
 def cores(alloc: Optional[Allocation]) -> str:

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import enum
 import json
+import math
 import os
 import re
 import secrets
@@ -30,7 +32,7 @@ from .ledger import (
     make_event,
     process_identity,
 )
-from .planner import GPU, Allocation, Plan, Policy, check_feasible, plan
+from .planner import EPS, GPU, Allocation, Plan, Policy, check_feasible, fit_gpus, plan
 from .resources import Inventory, format_cpu_list
 from .spec import Device, JobSpec, format_priority
 
@@ -97,24 +99,64 @@ def render_command(spec: JobSpec, alloc: Allocation) -> Union[str, List[str]]:
     return [fill(part) for part in spec.command]
 
 
+SHARE_ENV_VARS = ("TABLELY_GPU_SHARE", "TABLELY_GPU_MEMORY")
+
+
+def sharing_env(spec: JobSpec, alloc: Allocation, gpu_total: Optional[int], mps: bool) -> Dict[str, str]:
+    """Variables that keep a job within its part of a shared GPU.
+
+    The GPU itself cannot stop a process from taking all of its memory, so
+    frameworks are told: JAX preallocates only its share, TensorFlow grows
+    on demand instead of grabbing everything, and PyTorch scripts call
+    ``client.limit_gpu_memory()``. With MPS the CUDA driver also enforces a
+    compute (SM) share and a memory limit.
+    """
+    share = alloc.gpu_share
+    if not alloc.on_gpu or share is None:
+        return {}
+    limit = spec.gpu_memory if spec.gpu_memory is not None else (int(share * gpu_total) if gpu_total else None)
+    env = {
+        "TABLELY_GPU_SHARE": f"{share:.6g}",
+        "XLA_PYTHON_CLIENT_MEM_FRACTION": f"{math.floor(share * 1000) / 1000:g}",
+        "TF_FORCE_GPU_ALLOW_GROWTH": "true",
+    }
+    if limit:
+        env["TABLELY_GPU_MEMORY"] = str(limit)
+    if mps:
+        env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(max(1, round(share * 100)))
+        if limit:
+            env["CUDA_MPS_PINNED_DEVICE_MEM_LIMIT"] = f"0={max(1, limit // 1024 ** 2)}MB"
+    return env
+
+
 def build_env(
     base: Mapping[str, str],
     spec: JobSpec,
     alloc: Allocation,
     extra: Optional[Mapping[str, str]] = None,
+    *,
+    gpu_total: Optional[int] = None,
+    mps: bool = False,
 ) -> Dict[str, str]:
     """Environment for a job: its own ``env`` plus the resources it was given.
 
     GPU visibility is always enforced. Thread-count variables follow the core
-    count unless the job sets them itself. ``extra`` adds Tablely's own
-    bookkeeping variables (agent, run, ledger location).
+    count unless the job sets them itself; so do the shared-GPU limits (see
+    :func:`sharing_env`; ``gpu_total`` is the memory of the job's GPU).
+    ``extra`` adds Tablely's own bookkeeping variables (agent, run, ledger
+    location).
     """
     env = dict(base)
+    for var in SHARE_ENV_VARS:  # never inherit another job's share
+        env.pop(var, None)
     env.update(spec.env)
     values = job_values(spec, alloc)
     for var in THREAD_ENV_VARS:
         if var not in spec.env:
             env[var] = values["cpus"]
+    for var, value in sharing_env(spec, alloc, gpu_total, mps).items():
+        if var not in spec.env or var in SHARE_ENV_VARS:
+            env[var] = value
     env.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")  # match nvidia-smi numbering
     env.update(
         {
@@ -180,6 +222,7 @@ class Runner:
         ledger: Union[Ledger, MemoryLedger, None] = None,
         agent: Optional[str] = None,
         task: Optional[str] = None,
+        mps: bool = False,
     ) -> None:
         errors, self.warnings = check_feasible(inventory, jobs)
         if errors:
@@ -196,6 +239,7 @@ class Runner:
         self.ledger = ledger if ledger is not None else MemoryLedger()
         self.agent = agent or default_agent()
         self.task = task
+        self.mps = mps  # an MPS daemon runs: also set CUDA_MPS_* limits for shared GPUs
         self.run_id = secrets.token_hex(4)
         self.specs: Dict[str, JobSpec] = {spec.name: spec for spec in jobs}
         self.records: Dict[str, JobRecord] = {spec.name: JobRecord(spec) for spec in jobs}
@@ -326,6 +370,8 @@ class Runner:
             "cpus": spec.cpus,
             "max_cpus": spec.max_cpus,
             "max_gpus": spec.max_gpus,
+            "gpu_share": spec.gpu_share,
+            "gpu_memory": spec.gpu_memory,
             "switchable": spec.switchable,
             "switch_requested": None,
             "restarts": 0,
@@ -520,7 +566,8 @@ class Runner:
                     render_command(spec, alloc),
                     shell=spec.shell,
                     cwd=spec.cwd,
-                    env=build_env(self.base_env, spec, alloc, extra),
+                    env=build_env(self.base_env, spec, alloc, extra, mps=self.mps,
+                                  gpu_total=self.inventory.memory_of(alloc.gpus[0]) if alloc.gpus else None),
                     stdin=subprocess.DEVNULL,
                     stdout=log,
                     stderr=subprocess.STDOUT,
@@ -557,6 +604,7 @@ class Runner:
             f"prio {format_priority(spec.priority)}  {_fmt.placement(alloc)}  cores {_fmt.cores(alloc)}",
             device=alloc.device,
             gpus=list(alloc.gpus),
+            gpu_share=alloc.gpu_share,
             cpus=list(alloc.cpus),
             git=entry.get("git"),
         )
@@ -564,7 +612,7 @@ class Runner:
 
     def _resize(self, rec: JobRecord, cpus: Sequence[int]) -> None:
         old = rec.allocation
-        rec.allocation = Allocation(device=old.device, gpus=old.gpus, cpus=tuple(cpus))
+        rec.allocation = dataclasses.replace(old, cpus=tuple(cpus))
         affinity.pin_group(rec.process.pid, cpus)
         self._event("resize", rec, f"cores {_fmt.cores(old)} -> {_fmt.cores(rec.allocation)}", cpus=list(cpus))
 
@@ -666,9 +714,11 @@ def _switch_wishes(
     """Which running switchable jobs (any agent) should move, as ``key -> (target, reason)``.
 
     * up: a job that runs on CPU only because GPUs were busy moves to a GPU
-      nobody waits for, highest priority first;
+      nobody waits for (or, for a shared-GPU job, to room left on one),
+      highest priority first;
     * down: if a GPU-only job is waiting, lower-priority jobs that can run on
       CPU give up their GPUs, lowest priority first — only if that frees enough.
+      Jobs holding part of a GPU are not asked: that would not free a GPU.
 
     Jobs already asked keep their place (so requests are stable), others must
     have run ``grace`` seconds; a job stops being asked after ``max_switches``.
@@ -688,11 +738,24 @@ def _switch_wishes(
         )
 
     order = lambda kv: (-kv[1]["priority"], kv[1]["seq"])  # noqa: E731
-    spare = len(decision.spare_gpus)
+    gpu_waiting = any(specs[k].device is not Device.CPU for k in decision.waiting)
+    load = dict(decision.gpu_load)
+    spare = list(decision.spare_gpus)
     for key, job in sorted(board.jobs.items(), key=order):
-        if movable(job, on_gpu=False, target="gpu") and job["gpus"] <= spare:
-            wishes[key] = ("gpu", f"{spare} GPU(s) free and nobody waiting for them")
-            spare -= job["gpus"]
+        if not movable(job, on_gpu=False, target="gpu") or gpu_waiting:
+            continue
+        slot = fit_gpus(specs[key], inventory, load, spare)
+        if slot is None:
+            continue
+        gpus, share = slot
+        if share is None:
+            reason = f"{len(spare)} GPU(s) free and nobody waiting for them"
+        else:
+            reason = f"room on GPU {gpus[0]} and nobody waiting for it"
+        wishes[key] = ("gpu", reason)
+        for gpu in gpus:
+            load[gpu] += 1.0 if share is None else share
+        spare = [gpu for gpu in spare if load[gpu] <= EPS]
 
     blocked = sorted(
         (k for k in decision.waiting if specs[k].device is Device.GPU),
@@ -706,6 +769,7 @@ def _switch_wishes(
             (
                 (k, j) for k, j in board.jobs.items()
                 if movable(j, on_gpu=True, target="cpu") and j["priority"] < specs[top].priority
+                and not j["allocation"].get("gpu_share")
             ),
             key=lambda kv: (kv[1].get("switch_requested") != "cpu", kv[1]["priority"], -kv[1]["seq"]),
         )

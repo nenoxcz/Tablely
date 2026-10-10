@@ -108,13 +108,23 @@ def parse_fraction(text: Optional[str]) -> Optional[float]:
 def allocation_to_json(alloc: Optional[Allocation]) -> Optional[Dict[str, Any]]:
     if alloc is None:
         return None
-    return {"device": alloc.device, "gpus": list(alloc.gpus), "cpus": list(alloc.cpus)}
+    data = {"device": alloc.device, "gpus": list(alloc.gpus), "cpus": list(alloc.cpus)}
+    if alloc.gpu_share is not None:
+        data["gpu_share"] = alloc.gpu_share
+    return data
 
 
 def allocation_from_json(data: Optional[Mapping[str, Any]]) -> Optional[Allocation]:
     if not data:
         return None
-    return Allocation(device=data["device"], gpus=tuple(data["gpus"]), cpus=tuple(data["cpus"]))
+    return Allocation(device=data["device"], gpus=tuple(data["gpus"]), cpus=tuple(data["cpus"]),
+                      gpu_share=data.get("gpu_share"))
+
+
+def pool_inventory(pool: Mapping[str, Any]) -> Inventory:
+    """The shared pool recorded on the board, as an :class:`Inventory`."""
+    return Inventory(cpus=tuple(pool["cpus"]), gpus=tuple(pool["gpus"]),
+                     gpu_memory=tuple(pool.get("gpu_memory") or ()))
 
 
 def _empty_state() -> Dict[str, Any]:
@@ -157,6 +167,8 @@ class Board:
                 max_cpus=job["max_cpus"],
                 max_gpus=job.get("max_gpus"),
                 switchable=job.get("switchable", False),
+                gpu_share=job.get("gpu_share"),
+                gpu_memory=job.get("gpu_memory"),
             )
             if job["state"] == RUNNING:
                 running[key] = allocation_from_json(job["allocation"])
@@ -200,14 +212,11 @@ class Board:
         """
         pool = self.data.get("pool")
         if pool and (self.runs or self.jobs):
-            return (
-                Inventory(cpus=tuple(pool["cpus"]), gpus=tuple(pool["gpus"])),
-                Policy(backfill=pool["backfill"]),
-                True,
-            )
+            return pool_inventory(pool), Policy(backfill=pool["backfill"]), True
         self.data["pool"] = {
             "cpus": list(inventory.cpus),
             "gpus": list(inventory.gpus),
+            "gpu_memory": list(inventory.gpu_memory),
             "backfill": policy.backfill,
             "set_by": run_id,
             "set_at": time.time(),

@@ -45,3 +45,31 @@ device = "cpu"
 def test_resources(capsys):
     assert main(["resources", "--gpus", "0"]) == 0
     assert "GPU(s) [none]" in capsys.readouterr().out
+
+
+def test_plan_packs_small_jobs_onto_one_gpu(tmp_path, capsys):
+    jobfile = tmp_path / "jobs.toml"
+    jobfile.write_text("""
+[[jobs]]
+name = "big"
+command = "x"
+priority = 3
+
+[[jobs]]
+name = "half"
+command = "x"
+gpu_share = 0.5
+
+[[jobs]]
+name = "small"
+command = "x"
+gpu_memory = "6GiB"
+""")
+    assert main(["plan", str(jobfile), "--cpus", "8", "--gpus", "2", "--gpu-memory", "24GiB"]) == 0
+    out = capsys.readouterr().out
+    assert "2 GPU(s) [0 (24GiB), 1 (24GiB)]" in out
+    rows = {line.split()[0]: line for line in out.splitlines() if line.startswith("  ")}
+    assert "gpu x1" in rows["big"] and "GPU 0 " in rows["big"]
+    assert "gpu x0.5" in rows["half"] and "GPU 1 (share 0.5)" in rows["half"]
+    assert "gpu 6GiB" in rows["small"] and "GPU 1 (share 0.25)" in rows["small"]
+    assert "gpu use: 0 100% · 1 75%" in out

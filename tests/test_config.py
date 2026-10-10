@@ -46,6 +46,10 @@ def test_yaml_and_json(tmp_path):
         ({"resources": {"cores": 4}, "jobs": [{"name": "a", "command": "x"}]}, "unknown key"),
         ({"switch_grace": -1, "jobs": [{"name": "a", "command": "x"}]}, "switch_grace"),
         ({"jobs": [{"name": "a", "command": "x", "max_gpus": "lots"}]}, "max_gpus"),
+        ({"jobs": [{"name": "a", "command": "x", "gpu_share": 1.5}]}, "gpu_share"),
+        ({"jobs": [{"name": "a", "command": "x", "gpu_memory": "big"}]}, "gpu_memory"),
+        ({"resources": {"gpu_memory": "big"}, "jobs": [{"name": "a", "command": "x"}]}, "gpu_memory"),
+        ({"resources": {"mps": "yes"}, "jobs": [{"name": "a", "command": "x"}]}, "mps"),
     ],
 )
 def test_invalid_job_files_are_rejected(data, message):
@@ -61,3 +65,23 @@ def test_multi_gpu_and_switching_keys():
     job = config.jobs[0]
     assert (job.gpus, job.max_gpus, job.switchable) == (2, "all", True)
     assert (config.switch_grace, config.max_switches) == (5.0, 2)
+
+
+def test_gpu_sharing_keys():
+    config = parse_config({
+        "resources": {"gpus": "0", "gpu_memory": "24GiB", "mps": True},
+        "jobs": [{"name": "a", "command": "x", "gpu_share": 0.5},
+                 {"name": "b", "command": "x", "device": "any", "gpu_memory": "8GiB"}],
+    })
+    assert config.jobs[0].gpu_share == 0.5 and config.jobs[1].gpu_memory == 8 * 1024 ** 3
+    assert config.mps and config.inventory().memory_of("0") == 24 * 1024 ** 3
+
+
+def test_shared_gpu_example_fits_on_one_gpu(capsys):
+    from tablely.cli import main
+
+    example = EXAMPLE.with_name("shared_gpu.toml")
+    assert [j.gpu_share for j in load_config(example).jobs] == [0.5, None, 0.25]
+    assert main(["plan", str(example), "--gpus", "1", "--cpus", "4", "--gpu-memory", "24GiB"]) == 0
+    out = capsys.readouterr().out
+    assert out.count("start") == 3 and "gpu use: 0 100%" in out

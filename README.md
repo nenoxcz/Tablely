@@ -11,7 +11,7 @@
 
 Tablely는 작업 목록을 받아서:
 
-1. **GPU**: 중요도가 높은 작업부터 GPU를 통째로 배정합니다 (`CUDA_VISIBLE_DEVICES`).
+1. **GPU**: 중요도가 높은 작업부터 GPU를 통째로 배정합니다 (`CUDA_VISIBLE_DEVICES`). 작은 작업 여러 개는 GPU 한 장을 나눠 쓸 수 있습니다 (`gpu_share`, `gpu_memory`, MPS, MIG).
 2. **CPU 대체 실행**: GPU가 모자라면 `device = "any"` 작업은 CPU에서 돌립니다. GPU와 CPU 둘 다 놀지 않게 합니다.
 3. **CPU 코어**: 작업마다 겹치지 않는 코어 집합을 주고 그 코어에 고정(CPU affinity)합니다. 스레드 수 환경변수(`OMP_NUM_THREADS` 등)도 맞춰줍니다.
 4. **중요도 비례 분배**: 최소 코어를 보장한 뒤 남는 코어는 중요도에 비례해 나눕니다.
@@ -74,7 +74,7 @@ GPU 2장은 중요도 10, 5인 작업이 가져가고, GPU를 못 받은 `tabula
 
 ### 1. GPU: 중요도 순, 통째로
 
-대기 중인 작업을 중요도 높은 순서대로 봅니다. 중요도가 같으면 파일에 적힌 순서를 따릅니다. GPU가 필요한 작업은 비어 있는 GPU를 `gpus`개만큼 통째로 받습니다. 한 GPU를 두 작업이 나눠 쓰는 일은 없습니다. 이미 실행 중인 작업의 GPU는 절대 옮기지 않습니다.
+대기 중인 작업을 중요도 높은 순서대로 봅니다. 중요도가 같으면 파일에 적힌 순서를 따릅니다. GPU가 필요한 작업은 비어 있는 GPU를 `gpus`개만큼 통째로 받습니다. 한 GPU를 여러 작업이 나눠 쓰는 건 `gpu_share`나 `gpu_memory`를 적은 작업뿐입니다 ([7번](#7-gpu-나눠-쓰기-gpu_share--gpu_memory)). 이미 실행 중인 작업의 GPU는 절대 옮기지 않습니다.
 
 ### 2. `device`: 어디서 돌릴 수 있는가
 
@@ -124,6 +124,55 @@ GPU 2장은 중요도 10, 5인 작업이 가져가고, GPU를 못 받은 `tabula
   `command = "torchrun --nproc_per_node {num_gpus} train.py"`
 - 한 프로세스가 받은 GPU 여러 장에 데이터를 나눠 처리하려면 `tablely.stream.map_chunks`를 쓰세요 ([아래](#큰-데이터-순차-업로드-tablelystream)).
 
+### 7. GPU 나눠 쓰기: `gpu_share` / `gpu_memory`
+
+작은 모델, 평가, 하이퍼파라미터 탐색 같은 작업은 GPU 한 장을 다 쓰지 못합니다. 이런 작업은 GPU의 일부만 요청할 수 있습니다. 그러면 여러 작업이 한 GPU에 같이 올라갑니다. 전체 예시는 [`examples/shared_gpu.toml`](examples/shared_gpu.toml)에 있습니다.
+
+```toml
+[[jobs]]
+name = "small-cnn"
+command = "python train_small.py"
+gpu_share = 0.5           # GPU 한 장의 절반
+
+[[jobs]]
+name = "probe"
+command = "python probe.py"
+gpu_memory = "6GiB"       # GPU 메모리 6GiB만큼 (올라간 GPU 크기에 대한 비율로 바뀜)
+```
+
+- `gpu_share`는 0과 1 사이의 비율이고, `gpu_memory`는 메모리 양(`"10GiB"`, `"512MiB"`)입니다. 둘 중 하나만 적습니다.
+- `gpu_memory`는 작업이 올라간 GPU의 전체 메모리에 대한 비율로 바뀝니다. 예를 들어 24GiB GPU에서 6GiB는 0.25입니다.
+- 비율의 합이 1을 넘지 않으면 한 GPU에 여러 작업이 올라갑니다. **이미 가장 많이 찬 GPU부터 채웁니다 (best fit).** 그래서 통째로 쓸 수 있는 GPU가 최대한 많이 남습니다.
+- GPU를 통째로 쓰는 작업은 완전히 빈 GPU만 받습니다. 조금이라도 쓰이고 있는 GPU는 받지 않습니다.
+- 엄격한 우선순위도 그대로 지킵니다. 중요한 작업이 GPU를 기다리는 동안에는 덜 중요한 작업이 GPU의 남은 자리에 끼어들지 않습니다.
+- `device = "any"`와 함께 쓰면 GPU에 자리가 없을 때 CPU에서 돕니다. `switchable`이면 나중에 GPU에 자리가 나는 대로 옮겨갑니다. 반대로 GPU 일부만 쓰는 작업은 CPU로 밀려나지 않습니다. 옮겨도 GPU 한 장이 통째로 비지 않기 때문입니다.
+- 나눠 쓰는 작업은 GPU 1장만 씁니다. `gpus`는 1이어야 하고 `max_gpus`는 쓸 수 없습니다.
+- `gpu_memory`로 요청하려면 GPU 메모리 크기를 알아야 합니다. `nvidia-smi`로 자동 감지하고, 안 되면 `[resources] gpu_memory = "24GiB"`나 `--gpu-memory 24GiB`로 적습니다.
+
+**받은 몫은 어떻게 지키나요?** GPU는 한 프로세스가 메모리를 다 가져가는 걸 스스로 막지 못합니다. 그래서 Tablely는 프레임워크마다 받은 몫만 쓰도록 설정합니다.
+
+| 대상 | 방법 |
+|---|---|
+| JAX | `XLA_PYTHON_CLIENT_MEM_FRACTION`을 몫으로 설정 (처음에 잡는 메모리 = 몫) |
+| TensorFlow | `TF_FORCE_GPU_ALLOW_GROWTH=true` (처음에 다 잡지 않고 필요한 만큼만) |
+| PyTorch | 스크립트에서 `client.limit_gpu_memory()`를 한 번 호출 (`torch.cuda.set_per_process_memory_fraction`) |
+| MPS | `[resources] mps = true`(또는 `--mps`)면 `CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`(연산 비율)와 `CUDA_MPS_PINNED_DEVICE_MEM_LIMIT`(메모리 상한)도 설정합니다. 이 경우는 드라이버가 직접 강제합니다. |
+
+- 몫을 넘으면 그 작업만 메모리 부족(OOM)으로 실패하고, 옆 작업은 영향을 받지 않습니다.
+- 작업의 `env`에 같은 변수를 직접 적으면 그 값을 존중합니다.
+- **MPS**: MPS가 없으면 GPU를 나눠 쓰는 프로세스들이 시간을 쪼개 번갈아 연산합니다. MPS가 있으면 실제로 동시에 연산합니다. MPS 데몬은 Tablely가 띄우지 않습니다. 관리자가 `nvidia-cuda-mps-control -d`로 미리 띄워 두세요.
+- **MIG**: A100/H100처럼 MIG로 나눈 GPU는 `nvidia-smi -L`에서 MIG 인스턴스를 찾아 각각 GPU 한 장처럼 배정합니다. ID는 `MIG-<uuid>`이고, 메모리는 프로필 이름에서 읽습니다 (`3g.40gb` → 40GiB). 하드웨어가 메모리와 연산을 나누므로 가장 확실하게 격리됩니다. MIG 인스턴스도 다시 `gpu_share`로 나눠 쓸 수 있습니다.
+
+`tablely status`와 `tablely plan`에서 GPU마다 얼마나 찼는지 볼 수 있습니다.
+
+```
+machine  16 CPU core(s) [0-15] · 2 GPU(s) [0 (24GiB), 1 (24GiB)] · strict priority
+gpu use  0 ██████████ 100% 1 job · 1 ████████░░  83% 2 jobs
+...
+    small-cnn  ███░░░░░░░  30%  running  GPU 1 (share 0.5) · cores 1 (1) · prio 3
+    tiny-mlp   █░░░░░░░░░  12%  running  GPU 1 (share 0.33) · cores 2 (1) · prio 1
+```
+
 ## 작업 파일
 
 TOML, YAML, JSON을 지원합니다. 전체 예시는 [`examples/jobs.toml`](examples/jobs.toml)에 있습니다.
@@ -139,6 +188,8 @@ max_switches = 5          # 작업당 장치 이동 횟수 상한
 cpus = "0-15"             # 정수 = 앞에서부터 N개, 문자열/리스트 = 그 코어들. 기본: 사용 가능한 전체
 gpus = [0, 1]             # 정수 = N장, 리스트/문자열 = 그 ID들. 기본: CUDA_VISIBLE_DEVICES → nvidia-smi
 reserve_cpus = 1          # 앞쪽 N개 코어는 OS/Tablely용으로 남김
+gpu_memory = "24GiB"      # GPU 한 장의 메모리. nvidia-smi로 감지가 안 될 때만 (gpu_memory 작업용)
+mps = false               # true면 MPS 데몬이 있다고 보고 나눠 쓰는 작업에 CUDA_MPS_* 제한도 설정
 
 [[jobs]]
 name = "llm-finetune"     # 영문/숫자/._- (로그 파일 이름으로 씀)
@@ -154,6 +205,8 @@ cwd = "."                 # 작업 디렉터리 (기본: 작업 파일이 있는
 shell = false             # true면 command를 셸로 실행 (파이프, && 등)
 task = "lr 1e-3, warmup 500"  # 이 작업만의 목적 (기본: 위의 task)
 switchable = false        # true면 체크포인트 후 CPU<->GPU로 옮겨질 수 있음 (아래 참고)
+# gpu_share = 0.5         # GPU 한 장의 이만큼만 사용, 나머지는 다른 작업과 나눠 씀 (배분 규칙 7, max_gpus와 함께 못 씀)
+# gpu_memory = "10GiB"    # 또는 GPU 메모리 양으로 요청 (gpu_share와 함께 쓸 수 없음)
 ```
 
 `command`는 문자열 또는 리스트입니다. 아래 자리표시자는 작업 시작 시점의 값으로 바뀝니다.
@@ -167,7 +220,7 @@ switchable = false        # true면 체크포인트 후 CPU<->GPU로 옮겨질 �
 | `{cpu_list}` | 코어 목록 (`4-7`) |
 | `{name}` | 작업 이름 |
 
-CLI 옵션 `--cpus`, `--gpus`, `--reserve-cpus`, `--backfill`, `--log-dir`, `--task`는 작업 파일 설정보다 우선합니다.
+CLI 옵션 `--cpus`, `--gpus`, `--reserve-cpus`, `--gpu-memory`, `--backfill`, `--mps`, `--log-dir`, `--task`는 작업 파일 설정보다 우선합니다.
 
 ## 학습 스크립트와 연동
 
@@ -185,6 +238,8 @@ Tablely는 작업마다 다음 환경변수를 넣어 줍니다.
 | `TABLELY_HOME`, `TABLELY_RUN`, `TABLELY_JOB_KEY` | 공용 장부 위치와 이 작업의 키 (`client.progress`가 사용) |
 | `TABLELY_SWITCHABLE`, `TABLELY_RESTARTS` | 장치 이동 가능 여부, 지금까지 이동한 횟수 (재시작이면 1 이상) |
 | `TABLELY_CONTROL`, `TABLELY_REPLY` | 장치 이동 요청을 주고받는 파일 (`client.switch_requested` / `exit_for_switch`가 사용) |
+| `TABLELY_GPU_SHARE`, `TABLELY_GPU_MEMORY` | GPU를 나눠 쓸 때만: 받은 비율(`0.5`)과 바이트 단위 메모리 몫 (`client.gpu_share()` / `gpu_memory()`) |
+| `XLA_PYTHON_CLIENT_MEM_FRACTION`, `TF_FORCE_GPU_ALLOW_GROWTH`, `CUDA_MPS_*` | GPU를 나눠 쓸 때만: 프레임워크별 메모리 제한 ([배분 규칙 7](#7-gpu-나눠-쓰기-gpu_share--gpu_memory)) |
 
 환경변수만 읽어도 되지만, 선택적으로 쓸 수 있는 헬퍼도 있습니다.
 
@@ -192,6 +247,7 @@ Tablely는 작업마다 다음 환경변수를 넣어 줍니다.
 from tablely import client
 
 device = client.device()        # "cuda" / "cpu" (Tablely 밖에서 실행하면 기본값 "cpu")
+client.limit_gpu_memory()       # GPU를 나눠 쓰는 작업이면 PyTorch 메모리를 받은 몫으로 제한 (아니면 아무 일도 안 함)
 model.to(device)
 
 for epoch in range(epochs):
@@ -501,14 +557,14 @@ Claude Code는 이렇게 추가합니다: `claude mcp add tablely -- tablely mcp
 | 파일 | 역할 |
 |---|---|
 | `tablely/spec.py` | `JobSpec`: 작업 정의와 검증 |
-| `tablely/resources.py` | CPU/GPU 감지, `Inventory` |
-| `tablely/planner.py` | 배분 로직 (순수 함수, I/O 없음 → 테스트/미리보기 용이) |
+| `tablely/resources.py` | CPU/GPU 감지 (GPU 메모리, MIG 인스턴스 포함), `Inventory` |
+| `tablely/planner.py` | 배분 로직, GPU 나눠 쓰기 배치(best fit) (순수 함수, I/O 없음 → 테스트/미리보기 용이) |
 | `tablely/runner.py` | 프로세스 실행, 감시, 재분배, 종료 처리 (공용 장부를 통해 다른 에이전트와 함께 계획) |
 | `tablely/ledger.py` | 머신 공용 장부: 실행/작업 등록, 죽은 실행 정리, 이벤트 기록 |
 | `tablely/affinity.py` | 프로세스 그룹 전체 코어 고정 (Linux) |
 | `tablely/config.py` | TOML/YAML/JSON 작업 파일 로딩 |
 | `tablely/cli.py` | `tablely resources / plan / run / status / history / brief / resume / mcp / note` |
-| `tablely/client.py` | 학습 스크립트용 선택적 헬퍼 (`device`, `progress`, `note`, `switch_requested`, `exit_for_switch` ...) |
+| `tablely/client.py` | 학습 스크립트용 선택적 헬퍼 (`device`, `progress`, `note`, `limit_gpu_memory`, `switch_requested`, `exit_for_switch` ...) |
 | `tablely/stream.py` | 큰 데이터 순차 업로드: 메모리 맵 → 고정 RAM 버퍼 → GPU, CPU는 L3 크기 블록 |
 | `tablely/progress.py` | 실행·에이전트 달성률 계산, 재개 요약(`resume_prompt`, `session_prompt`), AI CLI 실행 |
 | `tablely/board_view.py` | `tablely status`(달성률 막대) / `history` / `brief` 출력 |
@@ -550,8 +606,8 @@ Claude Code 같은 코딩 에이전트 여러 개가 이 저장소를 동시에 
 
 - **데몬 + `tablely submit`**: 이미 돌고 있는 실행에 작업을 추가하거나 취소. 지금은 새 작업 목록마다 `tablely run`을 하나 더 띄워야 합니다.
 - **선점(preemption) 확대**: 지금은 `switchable` 작업만 체크포인트 후 CPU로 옮기는 방식으로 GPU를 내줍니다. GPU 전용 작업을 멈췄다가 나중에 재개하는 일반 선점은 아직 없습니다.
-- **실제 GPU 서버 검증**: `tablely.stream`의 CUDA 경로(고정 메모리, 비동기 복사, 다중 GPU `map_chunks`)는 GPU가 없는 환경에서 만들었습니다. 파이프라인 로직은 대역(가짜 backend)으로 테스트했지만 실제 GPU에서는 아직 돌려보지 않았습니다.
-- **GPU 나눠 쓰기**: 작은 작업 여러 개가 한 GPU를 공유 (MPS, MIG, 메모리 비율 제한).
+- **실제 GPU 서버 검증**: `tablely.stream`의 CUDA 경로(고정 메모리, 비동기 복사, 다중 GPU `map_chunks`)는 GPU가 없는 환경에서 만들었습니다. 파이프라인 로직은 대역(가짜 backend)으로 테스트했지만 실제 GPU에서는 아직 돌려보지 않았습니다. GPU 나눠 쓰기의 MPS 변수, MIG 감지, `limit_gpu_memory`도 실제 하드웨어에서는 아직 확인하지 않았습니다.
+- **사용량 기반 나눠 쓰기**: 지금은 요청한 몫(`gpu_share`/`gpu_memory`)만 보고 배치합니다. 실제 GPU 메모리 사용량(nvidia-smi)을 보고 더 채우거나 막는 기능은 아직 없습니다.
 - **토폴로지 인지**: GPU와 같은 NUMA 노드의 코어를 우선 배정.
 - **사용률 기반 조정**: 실제 GPU/CPU 사용률을 보고 코어를 재분배. 예를 들어 GPU 사용률이 낮으면 데이터 로딩 코어를 늘립니다.
 - **스레드 수 동적 조정**: 지금은 코어가 바뀌어도 `OMP_NUM_THREADS`는 시작 시점 값 그대로라서, 스크립트가 `client.sync_torch_threads()`를 불러야 합니다.

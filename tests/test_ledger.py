@@ -279,3 +279,32 @@ def test_brief_hands_over_results_progress_and_notes(tmp_path, capsys, isolated_
     assert "next: try lr 3e-4" in text
     assert main(["brief", "--agent", "someone-else"]) == 0
     assert "nothing finished in this window" in capsys.readouterr().out
+
+
+def test_agents_share_one_gpu_through_the_ledger(tmp_path):
+    GiB = 1024 ** 3
+    ledger = Ledger(tmp_path / "home")
+    inventory = Inventory(cpus=CPUS, gpus=("0",), gpu_memory=(24 * GiB,))
+    sleeper = py("import time; time.sleep(5)")
+    a = runner(tmp_path, [JobSpec(name="a", command=sleeper, gpu_memory="12GiB")], ledger, "alice", inventory)
+    b = runner(tmp_path, [JobSpec(name="b", command=sleeper, gpu_share=0.5, priority=2)], ledger, "bob",
+               inventory=Inventory(cpus=CPUS, gpus=("0",)))  # bob adopts alice's pool, memory included
+    c = runner(tmp_path, [JobSpec(name="c", command=sleeper, gpu_share=0.25)], ledger, "carol", inventory)
+    try:
+        for r in (a, b, c):
+            r._register()
+            r._tick()
+        assert b.inventory.memory_of("0") == 24 * GiB
+        assert a.records["a"].allocation.gpu_share == 0.5 and b.records["b"].allocation.gpu_share == 0.5
+        assert a.records["a"].allocation.gpus == b.records["b"].allocation.gpus == ("0",)
+        assert c.records["c"].state is JobState.PENDING
+        data = ledger.snapshot()
+        assert data["jobs"][f"{c.run_id}.c"]["wait_reason"] == "needs 0.25 of a GPU, at most 0 free on one"
+        view = render_status(data, events=ledger.history())
+        assert "GPU(s) [0 (24GiB)]" in view
+        assert "gpu use  0 ██████████ 100% 2 jobs" in view
+        assert "GPU 0 (share 0.5)" in view
+    finally:
+        for r in (a, b, c):
+            r._stop_all()
+            r._unregister()

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import time
-from typing import Any, List, Mapping, Optional, Sequence
+from typing import Any, Iterable, List, Mapping, Optional, Sequence
 
 from . import _fmt
-from .ledger import RUNNING, allocation_from_json
+from .ledger import RUNNING, allocation_from_json, pool_inventory
+from .planner import gpu_load
 from .progress import collect_runs
 from .resources import format_cpu_list
 from .spec import format_priority
@@ -37,10 +38,11 @@ def render_status(
 
     pool = data.get("pool")
     if pool:
-        gpus = ",".join(pool["gpus"]) if pool["gpus"] else "none"
+        gpus = ", ".join(pool_inventory(pool).gpu_labels()) or "none"
         mode = "backfill" if pool["backfill"] else "strict priority"
         lines.append(f"machine  {len(pool['cpus'])} CPU core(s) [{format_cpu_list(pool['cpus'])}] · "
                      f"{len(pool['gpus'])} GPU(s) [{gpus}] · {mode}")
+        lines += _gpu_use(pool, data.get("jobs", {}).values(), color)
     if not live:
         lines.append("nobody is running Tablely jobs on this machine")
     for run in live:
@@ -102,6 +104,21 @@ def _counts(run: Any, color: bool) -> str:
         if n:
             parts.append(_fmt.paint(f"{n} {state}", STATE_COLORS[state], color))
     return " · ".join(parts) or "no jobs"
+
+
+def _gpu_use(pool: Mapping[str, Any], jobs: Iterable[Mapping[str, Any]], color: bool) -> List[str]:
+    """``gpu use  0 █████░░░░░  50% 2 jobs · 1 ░░░░░░░░░░   0%`` while any job holds a GPU."""
+    allocs = [allocation_from_json(j.get("allocation")) for j in jobs if j["state"] == RUNNING]
+    allocs = [a for a in allocs if a is not None and a.on_gpu]
+    if not allocs or not pool["gpus"]:
+        return []
+    load = gpu_load(pool["gpus"], allocs)
+    parts = []
+    for gpu in pool["gpus"]:
+        n = sum(1 for a in allocs if gpu in a.gpus)
+        bar = _fmt.paint(_fmt.bar(min(load[gpu], 1.0), 10), "blue" if n else "dim", color)
+        parts.append(f"{gpu} {bar} {_fmt.percent(min(load[gpu], 1.0))}" + (f" {n} job{'s' * (n > 1)}" if n else ""))
+    return ["gpu use  " + " · ".join(parts)]
 
 
 def _run_block(run: Any, entries: Mapping[Any, Mapping[str, Any]], now: float, color: bool) -> List[str]:
@@ -188,7 +205,7 @@ def render_brief(
     if pool:
         mode = "backfill" if pool["backfill"] else "strict priority"
         lines.append(
-            f"machine: {len(pool['cpus'])} core(s), GPUs [{','.join(pool['gpus']) or 'none'}], {mode}"
+            f"machine: {len(pool['cpus'])} core(s), GPUs [{', '.join(pool_inventory(pool).gpu_labels()) or 'none'}], {mode}"
         )
 
     runs = [r for r in collect_runs(data, events) if wanted(r.agent) and (r.live or (r.ended or 0) >= since)]

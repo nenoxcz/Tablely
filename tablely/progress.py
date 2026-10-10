@@ -161,7 +161,7 @@ def _names_from_detail(detail: Optional[str]) -> List[str]:
 
 def _placement(event: Mapping[str, Any]) -> str:
     if event.get("device") == "gpu":
-        return f"GPU {','.join(event.get('gpus') or [])}"
+        return _fmt.gpu_placement(event.get("gpus") or [], event.get("gpu_share"))
     return "CPU"
 
 

@@ -2,11 +2,11 @@
   "session": "905a0ab8-ad25-5709-a2f8-2206ab23ba69",
   "agent": "claude",
   "branch": "nenoxcz/kind-maxwell-onq8cl",
-  "status": "working",
-  "task": "MCP server (tablely mcp): status/brief/resume/history/note for Claude and ChatGPT apps",
+  "status": "idle",
+  "task": "GPU sharing: gpu_share/gpu_memory packing, memory limits (JAX/TF env, PyTorch helper), MPS, MIG detection",
   "task_source": "agent",
   "started_at": "2026-10-08T05:38:03Z",
-  "updated_at": "2026-10-10T07:04:54Z",
+  "updated_at": "2026-10-10T07:22:33Z",
   "prompts": [
     {
       "at": "2026-10-08T07:05:34Z",
@@ -27,6 +27,10 @@
     {
       "at": "2026-10-10T06:56:51Z",
       "text": "지금 이렇게 claude app 이나 GPT app으로 사용해도 참조가 가능하게 하는 그런걸로"
+    },
+    {
+      "at": "2026-10-10T07:06:56Z",
+      "text": "GPU 나눠쓰기"
     }
   ],
   "files": [
@@ -37,13 +41,13 @@
     "tablely/mcp.py"
   ],
   "handoff": {
-    "at": "2026-10-10T07:04:54Z",
-    "text": "끝낸 것: tablely mcp (MCP 서버). 도구 tablely_status/resume/brief/history/note, 리소스 tablely://status·brief, 프롬프트 resume. stdio(Claude Desktop/Code, ssh gpu-server tablely mcp)와 --http(토큰 경로 /mcp/<token> 또는 Bearer, ~/.tablely/mcp-token). 핸드셰이크 방식(2024-11-05~2025-11-25), 공식 MCP Python SDK 2.3.0 클라이언트로 stdio·HTTP 확인. CLI와 공유 로직은 tablely/handoff.py. 다음: 실제 Claude 앱/ChatGPT 앱에 터널로 연결해 확인(이 환경에선 못 함), GPU 서버 stream 검증, 실패 작업 재실행. 주의: stdio 모드에서 stdout 출력 금지.",
-    "head": "da48402"
+    "at": "2026-10-10T07:22:33Z",
+    "text": "Done: GPU sharing. Jobs ask for gpu_share (0..1) or gpu_memory (\"10GiB\"); planner.fit_gpus packs them best-fit, Allocation.gpu_share goes through the ledger; whole-GPU jobs only take fully free GPUs; strict priority still holds GPU admissions. runner.sharing_env sets TABLELY_GPU_SHARE/MEMORY, XLA_PYTHON_CLIENT_MEM_FRACTION, TF_FORCE_GPU_ALLOW_GROWTH and, with mps, CUDA_MPS_*; client.limit_gpu_memory() for PyTorch. GPU memory and MIG instances detected via nvidia-smi (or [resources] gpu_memory / --gpu-memory). Status shows a per-GPU 'gpu use' line; plan shows WANTS x0.5/6GiB. Next: try MPS vars, MIG detection and limit_gpu_memory on a real GPU server (untested here, no GPU); maybe usage-based packing from nvidia-smi. Caveat: shared jobs are never pushed to CPU by _switch_wishes (it would not free a GPU).",
+    "head": "c5ba1a4"
   },
   "last_reply": {
-    "at": "2026-10-10T06:51:54Z",
-    "text": "CLI 도구로 맞춰 바꿨습니다. 웹 대시보드(`tablely ui`)는 지웠고, 진행 상황 보기와 재개하기를 둘 다 터미널 명령으로 옮겨서 푸시했습니다. 테스트 111개가 통과합니다. **`tablely status`: 달성률 막대** ``` claude-b · ViT augmentation study run 1bdb3462 · running 8s █░░░░░░░░░░░░░░░░░░░ 5% 2 running · 1 waiting vit-mixup █░░░░░░░░░ 6% running GPU 0 · cores 0 (1) · prio 8 epoch 26/400 ... vit-cutmix ░░░░░░░░░░ - waiting prio 6 needs 1 GPU(s), 0 free recently finished (last 12h) claude-a · ResNet-50 learning-rate sweep █████████████░░░░░░░ 67% 2 ok · 1 failed coding sessions a1b2c3d4 · 작업 달성률을 보여주고… ████████████░░░░░░░░ 60% 3/5 tasks · working next: 대시보드와 재개하기 버튼 …"
+    "at": "2026-10-10T07:05:12Z",
+    "text": "Claude 앱이나 ChatGPT 앱에서도 Tablely를 참조할 수 있도록 `tablely mcp`를 추가해 푸시했습니다. MCP는 AI 앱이 외부 도구에 연결할 때 쓰는 표준 방식입니다. 연결해 두면 대화 중에 \"학습 어디까지 됐어?\", \"claude-a가 하던 거 이어서 해줘\"라고 하면 AI가 Tablely를 직접 불러서 답합니다. 테스트 120개가 통과합니다. **AI가 쓸 수 있는 기능** - **상태 보기**: `tablely status`와 같은 달성률 막대 화면 - **재개 요약**: 이어서 할 작업의 요약. 대상을 안 주면 고를 수 있는 목록이 나옵니다 - **핸드오프 요약, 지난 기록 보기** - **메모 남기기**: 다음에 일할 에이전트가 볼 수 있습니다 - 작업을 시작하거나 멈추는 기능은 넣지 않았습니다. AI가 쓸 수 있는 동작은 메모 남기기뿐입니다. **앱별 연결 방법** - **Claude Desktop / Claude Code**: 앱이 `tablely mcp`를 직접 실행합니다. Tablely가 GPU 서버에 있으면 명령을 `ssh gpu-server tablely mcp`로 등록하면 됩니다. Claude Code는 `clau…"
   },
   "start_commit": "e18c080",
   "todos": [
@@ -75,6 +79,26 @@
     {
       "id": "11",
       "subject": "Verify with official MCP SDK client, tests, docs, commit",
+      "status": "completed"
+    },
+    {
+      "id": "12",
+      "subject": "GPU sharing: resources, spec, planner packing",
+      "status": "completed"
+    },
+    {
+      "id": "13",
+      "subject": "GPU sharing: ledger, runner env, client helpers",
+      "status": "completed"
+    },
+    {
+      "id": "14",
+      "subject": "GPU sharing: config, CLI, status display",
+      "status": "completed"
+    },
+    {
+      "id": "15",
+      "subject": "GPU sharing: tests, docs, handoff, commit",
       "status": "in_progress"
     }
   ]
