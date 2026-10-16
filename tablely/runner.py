@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple, 
 
 from . import _fmt, affinity
 from .ledger import (
+    BLOCKED,
     PENDING,
     RUNNING,
     Board,
@@ -50,6 +51,7 @@ SWITCH_EXIT = 75  # EX_TEMPFAIL: "checkpointed, restart me" (see client.exit_for
 
 
 class JobState(str, enum.Enum):
+    BLOCKED = "blocked"  # waits for the jobs it runs after
     PENDING = "pending"
     RUNNING = "running"
     SUCCEEDED = "succeeded"
@@ -72,6 +74,8 @@ class JobRecord:
     restarts: int = 0  # device switches so far
     switch_requested: Optional[str] = None  # "gpu"/"cpu" asked of the running process
     force_cpu: bool = False  # the job asked to stay on CPU (e.g. after running out of GPU memory)
+    retried: int = 0  # reruns after failures so far
+    stop_sent_at: Optional[float] = None  # when it was told to stop for running past its timeout
 
 
 def job_values(spec: JobSpec, alloc: Allocation) -> Dict[str, str]:
@@ -244,7 +248,9 @@ class Runner:
         self.mps = mps  # an MPS daemon runs: also set CUDA_MPS_* limits for shared GPUs
         self.run_id = secrets.token_hex(4)
         self.specs: Dict[str, JobSpec] = {spec.name: spec for spec in jobs}
-        self.records: Dict[str, JobRecord] = {spec.name: JobRecord(spec) for spec in jobs}
+        self.records: Dict[str, JobRecord] = {
+            spec.name: JobRecord(spec, state=JobState.BLOCKED if spec.after else JobState.PENDING) for spec in jobs
+        }
         self._keys = {name: f"{self.run_id}.{name}" for name in self.specs}
         self._names = {key: name for name, key in self._keys.items()}
         self._run_info: Dict[str, Any] = {}
@@ -272,7 +278,7 @@ class Runner:
         try:
             while True:
                 self._tick()
-                if not self._in_state(JobState.RUNNING) and not self._in_state(JobState.PENDING):
+                if not any(self._in_state(s) for s in (JobState.RUNNING, JobState.PENDING, JobState.BLOCKED)):
                     break
                 time.sleep(self.poll_interval)
         except KeyboardInterrupt:
@@ -295,9 +301,11 @@ class Runner:
             elif rec.state is JobState.FAILED:
                 result = rec.error or f"exit {rec.returncode}"
             else:
-                result = rec.state.value
+                result = rec.error or rec.state.value
             if rec.restarts:
                 result += f" ({rec.restarts} device switch{'es' if rec.restarts > 1 else ''})"
+            if rec.retried:
+                result += f" ({rec.retried + 1} attempts)"
             took = (
                 _fmt.duration(rec.ended_at - rec.started_at)
                 if rec.started_at is not None and rec.ended_at is not None
@@ -379,12 +387,16 @@ class Runner:
             "switchable": spec.switchable,
             "switch_requested": None,
             "restarts": 0,
+            "after": list(spec.after),
+            "retries": spec.retries,
+            "retried": 0,
+            "timeout": spec.timeout,
             "command": command_text(spec),
             "git": self._git.get(spec.cwd),
-            "state": PENDING,
+            "state": BLOCKED if spec.after else PENDING,
             "seq": seq,
             "submitted_at": now,
-            "wait_reason": None,
+            "wait_reason": f"after {', '.join(spec.after)}" if spec.after else None,
             "allocation": None,
             "pid": None,
             "pid_identity": None,
@@ -406,7 +418,7 @@ class Runner:
             board.add_run(self.run_id, dict(self._run_info))
         for name, rec in self.records.items():
             key = self._keys[name]
-            if rec.state in (JobState.PENDING, JobState.RUNNING):
+            if rec.state in (JobState.BLOCKED, JobState.PENDING, JobState.RUNNING):
                 entry = board.job(key)
                 if entry is None:
                     self._put(board, name, dict(self._shadow[name], seq=board.next_seq()))
@@ -424,7 +436,9 @@ class Runner:
         with self.ledger.locked() as board:
             board.prune()
             self._sync(board)
+            self._enforce_timeouts()
             self._reap(board)
+            self._unblock(board)
             self._schedule(board)
             self._flush(board)
 
@@ -556,6 +570,7 @@ class Runner:
             "TABLELY_JOB_KEY": key,
             "TABLELY_SWITCHABLE": "1" if spec.switchable else "0",
             "TABLELY_RESTARTS": str(rec.restarts),
+            "TABLELY_ATTEMPT": str(rec.retried + 1),
             "TABLELY_CONTROL": str(control.resolve()),
             "TABLELY_REPLY": str(reply.resolve()),
         }
@@ -565,7 +580,7 @@ class Runner:
         if self.ledger.home is not None:
             extra["TABLELY_HOME"] = str(self.ledger.home)
         try:
-            with open(rec.log_path, "ab" if rec.restarts else "wb") as log:  # keep earlier attempts
+            with open(rec.log_path, "ab" if rec.restarts or rec.retried else "wb") as log:  # keep earlier attempts
                 rec.process = subprocess.Popen(
                     render_command(spec, alloc),
                     shell=spec.shell,
@@ -588,6 +603,7 @@ class Runner:
         rec.state = JobState.RUNNING
         rec.allocation = alloc
         rec.started_at = time.time()
+        rec.stop_sent_at = None
         rec.wait_reason = None
         rec.switch_requested = None
         entry = board.job(key)
@@ -630,6 +646,12 @@ class Runner:
                     self._requeue(rec, board)
                     continue
                 rec.error = f"asked to switch devices more than {self.max_switches} times"
+            if rec.stop_sent_at is not None:
+                code = code or 1
+                rec.error = f"timed out after {_fmt.duration(rec.spec.timeout)}"
+            if code != 0 and rec.retried < rec.spec.retries:
+                self._retry(rec, board, code)
+                continue
             rec.state = JobState.SUCCEEDED if code == 0 else JobState.FAILED
             self._shadow[name] = board.job(self._keys[name]) or self._shadow[name]
             board.drop_job(self._keys[name])
@@ -638,7 +660,69 @@ class Runner:
             if code == 0:
                 self._event("done", rec, f"ok in {took}", **outcome)
             else:
-                self._event("fail", rec, f"exit {code} after {took}, see {rec.log_path}", **outcome)
+                why = rec.error or f"exit {code} after {took}"
+                self._event("fail", rec, f"{why}, see {rec.log_path}", **outcome)
+
+    def _retry(self, rec: JobRecord, board: Board, code: int) -> None:
+        """A failed job with retries left goes back to the queue."""
+        name = rec.spec.name
+        why = rec.error or f"exit {code}"
+        took = _fmt.duration(rec.ended_at - rec.started_at)
+        rec.retried += 1
+        rec.state = JobState.PENDING
+        rec.process = None
+        rec.allocation = None
+        rec.error = None
+        rec.switch_requested = None
+        reason = f"retry {rec.retried}/{rec.spec.retries} after {why}"
+        entry = board.job(self._keys[name])
+        entry.update(state=PENDING, allocation=None, pid=None, pid_identity=None, switch_requested=None,
+                     retried=rec.retried, wait_reason=reason)
+        self._shadow[name] = entry
+        rec.wait_reason = reason
+        self._event("retry", rec, f"{why} after {took}; trying again ({rec.retried}/{rec.spec.retries})",
+                    **self._outcome(name, returncode=code))
+
+    def _unblock(self, board: Board) -> None:
+        """Queue jobs whose ``after`` jobs all succeeded; skip those whose ``after`` jobs did not."""
+        changed = True
+        while changed:
+            changed = False
+            for name, rec in self.records.items():
+                if rec.state is not JobState.BLOCKED:
+                    continue
+                deps = [self.records[d] for d in rec.spec.after]
+                broken = next((d for d in deps if d.state in (JobState.FAILED, JobState.CANCELLED)), None)
+                if broken is not None:
+                    rec.state = JobState.CANCELLED
+                    rec.error = f"skipped: {broken.spec.name} {broken.state.value}"
+                    board.drop_job(self._keys[name])
+                    self._event("skip", rec, f"not started because {broken.spec.name} {broken.state.value}")
+                    changed = True
+                    continue
+                left = [d.spec.name for d in deps if d.state is not JobState.SUCCEEDED]
+                entry = board.job(self._keys[name])
+                if not left:
+                    rec.state = JobState.PENDING
+                    entry.update(state=PENDING, wait_reason=None)
+                    self._event("ready", rec, f"{', '.join(rec.spec.after)} done; queued")
+                    changed = True
+                else:
+                    entry["wait_reason"] = f"after {', '.join(left)}"
+                self._shadow[name] = entry
+
+    def _enforce_timeouts(self) -> None:
+        """Stop jobs running past their ``timeout``: SIGTERM, then SIGKILL after ``stop_timeout``."""
+        now = time.time()
+        for rec in self._in_state(JobState.RUNNING):
+            if rec.spec.timeout is None:
+                continue
+            if rec.stop_sent_at is None and now - rec.started_at >= rec.spec.timeout:
+                rec.stop_sent_at = now
+                self._signal_group(rec, signal.SIGTERM)
+                self._event("timeout", rec, f"ran longer than {_fmt.duration(rec.spec.timeout)}; stopping it")
+            elif rec.stop_sent_at is not None and now - rec.stop_sent_at >= self.stop_timeout:
+                self._signal_group(rec, signal.SIGKILL)
 
     def _stop_all(self) -> None:
         running = self._in_state(JobState.RUNNING)
@@ -654,7 +738,7 @@ class Runner:
                     running.remove(rec)
             if running:
                 time.sleep(min(self.poll_interval, 0.1))
-        for rec in self._in_state(JobState.PENDING):
+        for rec in self._in_state(JobState.PENDING) + self._in_state(JobState.BLOCKED):
             rec.state = JobState.CANCELLED
 
     # -- helpers --------------------------------------------------------------

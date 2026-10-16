@@ -182,8 +182,9 @@ def _cmd_plan(args: argparse.Namespace) -> int:
     ours = {}
     for spec in config.jobs:
         key = f"new.{spec.name}"
-        specs[key] = dataclasses.replace(spec, name=key)
-        pending.append(key)
+        specs[key] = dataclasses.replace(spec, name=key, after=())
+        if not spec.after:  # the rest only start once the jobs they run after are done
+            pending.append(key)
         ours[key] = spec
     decision = plan(inventory, specs, running, pending, policy)
     rows = []
@@ -192,7 +193,10 @@ def _cmd_plan(args: argparse.Namespace) -> int:
         wants = f"{spec.device.value} {spec.describe_gpu_need()}".strip()
         if spec.ram:
             wants += f", {format_bytes(spec.ram)} RAM"
-        status = "start" if alloc else f"wait: {decision.waiting[key]}"
+        if spec.after:
+            status = _fmt.clip(f"after {', '.join(spec.after)}", 60)
+        else:
+            status = "start" if alloc else f"wait: {decision.waiting[key]}"
         rows.append(
             [spec.name, format_priority(spec.priority), wants, _fmt.placement(alloc), _fmt.cores(alloc), status]
         )

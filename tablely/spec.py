@@ -40,6 +40,10 @@ class JobSpec:
 
     ``ram`` reserves RAM before the job starts, for tables kept outside GPU
     memory (see :mod:`tablely.tables`); a job waits until that much is free.
+
+    Pipelines: a job with ``after`` starts only once those jobs (of the same
+    run) succeeded, and is skipped if one of them fails. ``retries`` reruns a
+    failed job; ``timeout`` stops a job that runs too long (a failure).
     """
 
     name: str
@@ -58,6 +62,9 @@ class JobSpec:
     gpu_share: Optional[float] = None  # fraction of one GPU (0 < x < 1); others may use the rest
     gpu_memory: Optional[Union[int, str]] = None  # GPU memory to set aside instead, e.g. "10GiB"
     ram: Optional[Union[int, str]] = None  # RAM reserved for this job's tables (tablely.tables), e.g. "32GiB"
+    after: Sequence[str] = ()  # jobs of the same run that must succeed before this one starts
+    retries: int = 0  # run again up to this many times after a failure
+    timeout: Optional[Union[float, str]] = None  # stop after this long ("2h", "30m", seconds): a failure
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.match(self.name):
@@ -112,6 +119,7 @@ class JobSpec:
                 object.__setattr__(self, "ram", parse_bytes(self.ram))
             except ValueError as exc:
                 raise ValueError(f"{self.name}: ram: {exc}") from None
+        self._check_pipeline()
         if not isinstance(self.switchable, bool):
             raise ValueError(f"{self.name}: switchable must be true or false")
         object.__setattr__(self, "env", {str(k): str(v) for k, v in dict(self.env).items()})
@@ -139,6 +147,22 @@ class JobSpec:
             raise ValueError(f"{self.name}: a job sharing a GPU uses exactly one (gpus = 1)")
         if self.max_gpus is not None:
             raise ValueError(f"{self.name}: max_gpus cannot be combined with gpu_share/gpu_memory")
+
+    def _check_pipeline(self) -> None:
+        after = (self.after,) if isinstance(self.after, str) else tuple(self.after)
+        for dep in after:
+            if not isinstance(dep, str) or not _NAME_RE.match(dep):
+                raise ValueError(f"{self.name}: after: {dep!r} is not a job name")
+            if dep == self.name:
+                raise ValueError(f"{self.name}: a job cannot run after itself")
+        object.__setattr__(self, "after", tuple(dict.fromkeys(after)))
+        if not _is_int(self.retries) or self.retries < 0:
+            raise ValueError(f"{self.name}: retries must be a non-negative integer")
+        if self.timeout is not None:
+            try:
+                object.__setattr__(self, "timeout", parse_duration(self.timeout))
+            except ValueError as exc:
+                raise ValueError(f"{self.name}: timeout: {exc}") from None
 
     @property
     def shared(self) -> bool:
@@ -186,6 +210,27 @@ def _is_int(value: object) -> bool:
 
 def _is_number(value: object) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+_DURATION = re.compile(r"(\d+(?:\.\d+)?)\s*([smhd]?)", re.IGNORECASE)
+_SECONDS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+
+
+def parse_duration(value: Union[int, float, str]) -> float:
+    """Seconds in ``90``, ``"90s"``, ``"30m"``, ``"2h"``, ``"1h30m"`` or ``"1d"``."""
+    if isinstance(value, bool):
+        raise ValueError(f"not a duration: {value!r}")
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+    else:
+        text = str(value).strip()
+        parts = list(_DURATION.finditer(text))
+        if not parts or "".join(m.group(0) for m in parts).replace(" ", "") != text.replace(" ", ""):
+            raise ValueError(f'not a duration: {value!r} (use e.g. "90s", "30m", "2h")')
+        seconds = sum(float(m.group(1)) * _SECONDS[m.group(2).lower()] for m in parts)
+    if not seconds > 0 or math.isinf(seconds):
+        raise ValueError("a duration must be positive")
+    return seconds
 
 
 def format_priority(priority: float) -> str:

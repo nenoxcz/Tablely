@@ -20,7 +20,8 @@ Tablely는 작업 목록을 받아서:
 7. **큰 데이터 순차 업로드**: GPU 메모리나 RAM보다 큰 데이터를 조각으로 나눠 디스크 → RAM → PCIe 버스 → GPU 순서로 계속 흘려 보냅니다. CPU에서는 L3 캐시에 맞는 크기로 쪼개서 처리합니다 (`tablely.stream`). 임베딩 같은 큰 표는 미리 잡아 둔 RAM에 두고 VRAM 대신 씁니다. GPU 메모리가 모자라면 자동으로 RAM으로 옮깁니다 (`ram`, `tablely.tables`).
 8. **달성률과 재개하기 (CLI)**: `tablely status`로 작업마다 달성률(%)을 막대로 봅니다. `tablely resume`으로 이어갈 작업을 고르면, 지금까지 한 일을 요약해서 AI CLI(예: `claude`)에게 넘겨 바로 시작합니다.
 9. **AI 앱에서 참조 (MCP)**: `tablely mcp`를 연결해 두면 Claude 앱, Claude Desktop/Code, ChatGPT 앱에서 대화하다가 AI가 Tablely의 진행 상황과 재개 요약을 직접 꺼내 봅니다.
-10. **여러 에이전트와 핸드오프**: 같은 머신에서 여러 에이전트(AI 에이전트나 사람)가 각자 `tablely run`을 해도 GPU와 코어를 함께 계획합니다. 누가 무엇을 왜 돌리고 있는지는 자동으로 기록합니다. 그래서 다음 에이전트는 따로 인수인계 문서를 받지 않아도 `tablely brief`로 이어받을 수 있습니다.
+10. **파이프라인과 스윕 (분업)**: 전처리(CPU) → 학습 여러 개(GPU) → 평가처럼 단계를 나누면, 각 단계가 맞는 장치에서 앞 단계가 끝나는 대로 시작합니다 (`after`). 하이퍼파라미터 조합은 한 줄로 펼쳐서 GPU 여러 장에 나눠 돌립니다 (`matrix`). 실패하면 다시 돌리고(`retries`), 너무 오래 걸리면 멈춥니다(`timeout`).
+11. **여러 에이전트와 핸드오프**: 같은 머신에서 여러 에이전트(AI 에이전트나 사람)가 각자 `tablely run`을 해도 GPU와 코어를 함께 계획합니다. 누가 무엇을 왜 돌리고 있는지는 자동으로 기록합니다. 그래서 다음 에이전트는 따로 인수인계 문서를 받지 않아도 `tablely brief`로 이어받을 수 있습니다.
 
 ## 설치
 
@@ -206,6 +207,9 @@ cwd = "."                 # 작업 디렉터리 (기본: 작업 파일이 있는
 shell = false             # true면 command를 셸로 실행 (파이프, && 등)
 task = "lr 1e-3, warmup 500"  # 이 작업만의 목적 (기본: 위의 task)
 switchable = false        # true면 체크포인트 후 CPU<->GPU로 옮겨질 수 있음 (아래 참고)
+after = ["prep"]          # 이 작업들이 성공한 뒤에 시작 (아래 "파이프라인과 스윕")
+retries = 1               # 실패하면 이만큼 다시 실행
+timeout = "2h"            # 이보다 오래 걸리면 멈추고 실패로 처리 ("90s", "30m", "1h30m")
 # gpu_share = 0.5         # GPU 한 장의 이만큼만 사용, 나머지는 다른 작업과 나눠 씀 (배분 규칙 7, max_gpus와 함께 못 씀)
 # gpu_memory = "10GiB"    # 또는 GPU 메모리 양으로 요청 (gpu_share와 함께 쓸 수 없음)
 ram = "32GiB"             # 시작 전에 잡아 두는 RAM, tablely.tables가 표를 둘 자리 (아래 참고)
@@ -222,7 +226,61 @@ ram = "32GiB"             # 시작 전에 잡아 두는 RAM, tablely.tables가 �
 | `{cpu_list}` | 코어 목록 (`4-7`) |
 | `{name}` | 작업 이름 |
 
+`matrix`의 키(예: `{lr}`)는 작업 파일을 읽을 때 각 조합의 값으로 바뀝니다 (아래 "파이프라인과 스윕").
+
 CLI 옵션 `--cpus`, `--gpus`, `--reserve-cpus`, `--gpu-memory`, `--ram`, `--backfill`, `--mps`, `--log-dir`, `--task`는 작업 파일 설정보다 우선합니다.
+
+## 파이프라인과 스윕: `after`, `matrix`, `retries`, `timeout`
+
+큰 작업을 단계로 나누면, 각 단계가 자기에게 맞는 장치에서 앞 단계가 끝나는 대로 시작합니다. 예를 들어 전처리는 CPU 코어, 학습 여러 개는 GPU 여러 장, 평가는 남는 장치에서 돌립니다.
+
+```toml
+task = "lr sweep"
+
+[[jobs]]
+name = "prep"
+command = "python prep.py"
+device = "cpu"
+cpus = 8
+
+[[jobs]]
+name = "train"
+command = "python train.py --lr {lr} --seed {seed}"
+matrix = { lr = [1e-3, 3e-4], seed = [0, 1] }   # 4개로 펼쳐짐
+after = ["prep"]
+retries = 1
+timeout = "6h"
+
+[[jobs]]
+name = "eval"
+command = "python eval.py"
+device = "any"
+after = ["train"]          # 스윕 전체(4개)가 끝난 뒤
+```
+
+- **`after`**: 같은 실행에 있는 작업 이름 목록입니다. 그 작업들이 모두 성공해야 큐에 들어갑니다.
+  - 기다리는 동안에는 계획에 넣지 않습니다. 그래서 GPU나 코어를 미리 잡아 두지 않고, 다른 작업과 다른 에이전트가 그 자원을 씁니다.
+  - 앞 단계가 실패하거나 취소되면 뒤 단계는 시작하지 않고 건너뜁니다 (`skipped: prep failed`). 그 뒤의 단계들도 연달아 건너뜁니다.
+  - 없는 이름이나 서로를 기다리는 순환은 시작 전에 오류로 알려줍니다.
+- **`matrix`**: 값 목록의 모든 조합마다 작업을 하나씩 만듭니다.
+  - 이름은 `train.lr-0.001.seed-0`처럼 붙습니다.
+  - `command`, `env` 값, `cwd`, `task`의 `{lr}` 같은 자리에 그 조합의 값이 들어갑니다. `task`에는 조합이 붙어서 (`lr sweep (lr=0.001, seed=0)`) status와 재개 요약에서 어떤 조합인지 보입니다.
+  - `after = ["train"]`처럼 스윕 이름을 쓰면 펼쳐진 작업 전부를 기다립니다.
+  - 펼쳐진 작업들은 보통 작업처럼 중요도 순으로 GPU 여러 장에 나눠 배정됩니다. GPU를 나눠 쓰는 작은 작업(`gpu_share`)이면 한 GPU에 여러 개가 올라갑니다.
+- **`retries`**: 0이 아닌 코드로 끝나면 큐에 다시 넣습니다. 로그는 이어서 씁니다. 몇 번째 시도인지는 `TABLELY_ATTEMPT`(1부터)로 알 수 있습니다.
+- **`timeout`**: 이 시간이 지나면 SIGTERM을 보내고, 그래도 안 끝나면 SIGKILL로 멈춥니다. 실패로 치므로 `retries`가 있으면 다시 돌립니다.
+- `tablely plan`은 기다리는 단계를 `after prep`으로 보여주고, `tablely status`는 무엇을 기다리는지를 보여줍니다.
+
+```
+[04:37:26] start  train.lr-0.001.seed-0  prio 1  CPU  cores 0-1 (2)
+[04:37:26] start  train.lr-0.001.seed-1  prio 1  CPU  cores 2-3 (2)
+[04:37:27] done   train.lr-0.001.seed-0  ok in 2s
+[04:37:27] retry  train.lr-0.001.seed-1  exit 1 after 2s; trying again (1/1)
+[04:37:27] start  train.lr-0.001.seed-1  prio 1  CPU  cores 0-3 (4)
+[04:37:29] done   train.lr-0.001.seed-1  ok in 2s
+[04:37:29] ready  eval                   train.lr-0.001.seed-0, train.lr-0.001.seed-1 done; queued
+[04:37:29] start  eval                   prio 1  CPU  cores 0-3 (4)
+```
 
 ## 학습 스크립트와 연동
 
@@ -238,6 +296,7 @@ Tablely는 작업마다 다음 환경변수를 넣어 줍니다.
 | `TABLELY_JOB`, `TABLELY_PRIORITY` | 작업 이름, 중요도 |
 | `TABLELY_AGENT`, `TABLELY_TASK` | 이 작업을 띄운 에이전트, 작업 목적 |
 | `TABLELY_HOME`, `TABLELY_RUN`, `TABLELY_JOB_KEY` | 공용 장부 위치와 이 작업의 키 (`client.progress`가 사용) |
+| `TABLELY_ATTEMPT` | 몇 번째 시도인지 (1부터, `retries`로 다시 돌면 늘어남) |
 | `TABLELY_SWITCHABLE`, `TABLELY_RESTARTS` | 장치 이동 가능 여부, 지금까지 이동한 횟수 (재시작이면 1 이상) |
 | `TABLELY_CONTROL`, `TABLELY_REPLY` | 장치 이동 요청을 주고받는 파일 (`client.switch_requested` / `exit_for_switch`가 사용) |
 | `TABLELY_GPU_SHARE`, `TABLELY_GPU_MEMORY` | GPU를 나눠 쓸 때만: 받은 비율(`0.5`)과 바이트 단위 메모리 몫 (`client.gpu_share()` / `gpu_memory()`) |

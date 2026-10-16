@@ -19,7 +19,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from . import _fmt
 from .ledger import RUNNING, allocation_from_json
 
-RESULT_STATES = {"done": "ok", "fail": "failed", "stop": "cancelled"}
+RESULT_STATES = {"done": "ok", "fail": "failed", "stop": "cancelled", "skip": "cancelled"}
 
 
 @dataclass
@@ -113,6 +113,8 @@ def collect_runs(data: Mapping[str, Any], events: Sequence[Mapping[str, Any]]) -
                 j.detail = e.get("detail")
             elif kind == "requeue":
                 j.state, j.switches, j.detail = "waiting", j.switches + 1, e.get("detail")
+            elif kind == "retry":
+                j.state, j.detail = "waiting", e.get("detail")
             elif kind == "wait":
                 if j.state == "waiting":
                     j.detail = e.get("detail")

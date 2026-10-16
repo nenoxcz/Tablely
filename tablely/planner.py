@@ -336,4 +336,36 @@ def check_feasible(inventory: Inventory, jobs: Sequence[JobSpec]) -> Tuple[List[
                 errors.append(f"{spec.name}: {problem}")
             else:
                 warnings.append(f"{spec.name}: {problem}; it will always run on CPU")
+    errors += _check_order(jobs)
     return errors, warnings
+
+
+def _check_order(jobs: Sequence[JobSpec]) -> List[str]:
+    """``after`` must name jobs of the same batch, without cycles."""
+    names = {spec.name for spec in jobs}
+    errors = [
+        f"{spec.name}: after: no job named {dep!r} in this run"
+        for spec in jobs for dep in spec.after if dep not in names
+    ]
+    after = {spec.name: [d for d in spec.after if d in names] for spec in jobs}
+    state: Dict[str, int] = {}  # 1 = being visited, 2 = done
+
+    def visit(name: str, path: List[str]) -> Optional[List[str]]:
+        state[name] = 1
+        for dep in after[name]:
+            if state.get(dep) == 1:
+                return path[path.index(dep):] + [dep] if dep in path else [name, dep]
+            if dep not in state:
+                cycle = visit(dep, path + [dep])
+                if cycle:
+                    return cycle
+        state[name] = 2
+        return None
+
+    for name in after:
+        if name not in state:
+            cycle = visit(name, [name])
+            if cycle:
+                errors.append("after: jobs wait for each other in a circle: " + " -> ".join(cycle))
+                break
+    return errors

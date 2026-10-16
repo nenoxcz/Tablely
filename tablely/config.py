@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import itertools
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Mapping, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 from .planner import Policy
 from .resources import CpuSetting, GpuSetting, Inventory, build_inventory, parse_bytes
@@ -22,7 +24,10 @@ _RESOURCE_KEYS = {"cpus", "gpus", "reserve_cpus", "gpu_memory", "mps", "ram"}
 _JOB_KEYS = {
     "name", "command", "priority", "device", "gpus", "max_gpus", "cpus", "max_cpus",
     "env", "cwd", "shell", "task", "switchable", "gpu_share", "gpu_memory", "ram",
+    "after", "retries", "timeout", "matrix",
 }
+_RUNTIME_PLACEHOLDERS = {"name", "device", "gpus", "num_gpus", "cpus", "cpu_list"}
+_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class ConfigError(ValueError):
@@ -90,15 +95,23 @@ def parse_config(data: Any, base_dir: Union[str, Path] = ".") -> Config:
     raw_jobs = data.get("jobs")
     if not isinstance(raw_jobs, list) or not raw_jobs:
         raise ConfigError("job file must define at least one job under 'jobs'")
-    jobs = [_parse_job(raw, i, base_dir) for i, raw in enumerate(raw_jobs, start=1)]
-
-    backfill = data.get("backfill", False)
-    if not isinstance(backfill, bool):
-        raise ConfigError("backfill must be true or false")
 
     task = data.get("task")
     if task is not None and not isinstance(task, str):
         raise ConfigError("task must be a string")
+
+    expanded: List[Tuple[int, Mapping[str, Any]]] = []
+    groups: Dict[str, List[str]] = {}  # a swept job's name -> the names of its variants
+    for i, raw in enumerate(raw_jobs, start=1):
+        variants = _expand_matrix(raw, i, task)
+        if len(variants) > 1 or "matrix" in _mapping(raw, f"job #{i}"):
+            groups[str(raw.get("name"))] = [v["name"] for v in variants]
+        expanded += [(i, v) for v in variants]
+    jobs = [_parse_job(_resolve_after(raw, groups), i, base_dir) for i, raw in expanded]
+
+    backfill = data.get("backfill", False)
+    if not isinstance(backfill, bool):
+        raise ConfigError("backfill must be true or false")
 
     switch_grace = data.get("switch_grace", 60.0)
     if isinstance(switch_grace, bool) or not isinstance(switch_grace, (int, float)) or switch_grace < 0:
@@ -135,6 +148,75 @@ def parse_config(data: Any, base_dir: Union[str, Path] = ".") -> Config:
         mps=mps,
         ram=resources.get("ram"),
     )
+
+
+def _expand_matrix(raw: Any, index: int, run_task: Optional[str]) -> List[Dict[str, Any]]:
+    """One job per combination of ``matrix`` values, with ``{key}`` filled in.
+
+    ``matrix = {lr = [1e-3, 3e-4], seed = [0, 1]}`` on job ``train`` gives
+    ``train.lr-0.001.seed-0`` and three more; ``{lr}`` and ``{seed}`` in the
+    command, env values, cwd and task are replaced by each variant's values.
+    """
+    raw = dict(_mapping(raw, f"job #{index}"))
+    matrix = raw.pop("matrix", None)
+    if matrix is None:
+        return [raw]
+    where = f"job {raw.get('name', f'#{index}')!r}"
+    matrix = _mapping(matrix, f"{where}: matrix")
+    if not matrix:
+        raise ConfigError(f"{where}: matrix is empty")
+    for key, values in matrix.items():
+        if not _KEY_RE.match(key) or key in _RUNTIME_PLACEHOLDERS:
+            raise ConfigError(f"{where}: matrix key {key!r} must be a plain name other than "
+                              f"{', '.join(sorted(_RUNTIME_PLACEHOLDERS))}")
+        if not isinstance(values, list) or not values or not all(
+            isinstance(v, (str, int, float, bool)) for v in values
+        ):
+            raise ConfigError(f"{where}: matrix {key} must be a non-empty list of values")
+    keys = list(matrix)
+    pattern = re.compile(r"\{(" + "|".join(map(re.escape, keys)) + r")\}")
+    variants = []
+    for combo in itertools.product(*(matrix[k] for k in keys)):
+        values = {k: _text(v) for k, v in zip(keys, combo)}
+
+        def fill(text: Any) -> Any:
+            return pattern.sub(lambda m: values[m.group(1)], text) if isinstance(text, str) else text
+
+        job = dict(raw)
+        job["name"] = ".".join([str(raw.get("name"))] + [f"{k}-{_slug(values[k])}" for k in keys])
+        command = raw.get("command")
+        job["command"] = [fill(part) for part in command] if isinstance(command, list) else fill(command)
+        if isinstance(raw.get("env"), Mapping):
+            job["env"] = {k: fill(v) for k, v in raw["env"].items()}
+        if "cwd" in raw:
+            job["cwd"] = fill(raw["cwd"])
+        label = ", ".join(f"{k}={values[k]}" for k in keys)
+        base = fill(raw.get("task")) if raw.get("task") else run_task
+        job["task"] = f"{base} ({label})" if base else label
+        variants.append(job)
+    return variants
+
+
+def _text(value: Any) -> str:
+    return ("true" if value else "false") if isinstance(value, bool) else str(value)
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]", "_", text) or "_"
+
+
+def _resolve_after(raw: Mapping[str, Any], groups: Mapping[str, List[str]]) -> Mapping[str, Any]:
+    """``after = ["train"]`` on a swept job ``train`` means after every variant of it."""
+    after = raw.get("after")
+    if after is None:
+        return raw
+    names = [after] if isinstance(after, str) else after
+    if not isinstance(names, list):
+        raise ConfigError(f"job {raw.get('name')!r}: after must be a list of job names")
+    resolved: List[Any] = []
+    for name in names:
+        resolved += groups.get(name, [name]) if isinstance(name, str) else [name]
+    return dict(raw, after=resolved)
 
 
 def _parse_job(raw: Any, index: int, base_dir: Path) -> JobSpec:

@@ -3,10 +3,10 @@
   "agent": "claude",
   "branch": "nenoxcz/kind-maxwell-onq8cl",
   "status": "working",
-  "task": "RAM as VRAM substitute: reserve pinned RAM per job, keep big tables there, spill from GPU on OOM",
+  "task": "Pipelines (after/retries/timeout/matrix sweeps) and a local AI gateway that swaps model servers in and out of GPUs",
   "task_source": "agent",
   "started_at": "2026-10-08T05:38:03Z",
-  "updated_at": "2026-10-10T07:39:33Z",
+  "updated_at": "2026-10-16T04:38:41Z",
   "prompts": [
     {
       "at": "2026-10-08T07:05:34Z",
@@ -35,6 +35,10 @@
     {
       "at": "2026-10-10T07:25:07Z",
       "text": "학습이 조금 걸리면 그 전에 만들어둔 렘에 자동으로 테이블 올려두고 vram 대용으로 쓰는 그런 활용"
+    },
+    {
+      "at": "2026-10-16T04:31:32Z",
+      "text": "일단 뭐 더 해줘. 좀 더 상용프로그램처럼 더 강력한 분업화나 로컬 AI 스와핑 이런거"
     }
   ],
   "files": [
@@ -44,16 +48,17 @@
     "tablely/_dashboard_page.py",
     "tablely/mcp.py",
     "tablely/tables.py",
-    "tests/test_tables.py"
+    "tests/test_tables.py",
+    "tests/test_pipeline.py"
   ],
   "handoff": {
-    "at": "2026-10-10T07:39:33Z",
-    "text": "Done: RAM as VRAM substitute. Jobs reserve ram = \"32GiB\" before they start (planner hands RAM out like cores, [resources] ram / --ram, default half of MemTotal; strict priority holds it). tablely.tables: tables.store() pins that RAM once (Arena), put() places tables on GPU within the VRAM budget else in RAM, gather/rows/set_rows/add_rows, store.guard(step) moves the biggest GPU table to RAM on OOM and reruns the step, promote() moves tables back; moves are reported to the ledger (status 'ram 6GiB/8GiB', 'ram use' line, history 'tables' events). Example: examples/ram_tables.toml + table_train.py. Next: run TorchBackend on a real GPU (pinned arena views, index_select into pinned rows, OOM detection) - only tested with FakeGpu since PyTorch can't be installed here. Caveat: a guarded step must be safe to rerun (zero grads first, updates last).",
-    "head": "a5508af"
+    "at": "2026-10-16T04:38:41Z",
+    "text": "Done (pipelines): after = [...] (job waits as state 'blocked', not planned, skipped if a dependency fails), retries (TABLELY_ATTEMPT), timeout (SIGTERM then SIGKILL, counts as failure), matrix sweeps expanded in config.py (names train.lr-0.001.seed-0, {key} filled in command/env/cwd/task, after = [group] waits for every variant). Next in this session: local AI gateway (tablely serve) that swaps model servers in and out of GPUs.",
+    "head": "a892745"
   },
   "last_reply": {
-    "at": "2026-10-10T07:23:02Z",
-    "text": "이제 작은 작업 여러 개가 GPU 한 장을 같이 쓸 수 있습니다. 커밋 `a5508af`를 `nenoxcz` 이름으로 `nenoxcz/kind-maxwell-onq8cl` 브랜치에 푸시했습니다. 테스트 145개가 Python 3.13과 3.10에서 모두 통과했습니다. 다만 이 환경에는 GPU가 없어서 실제 GPU에서는 아직 돌려보지 못했습니다. **쓰는 법** ```toml [[jobs]] name = \"small-cnn\" gpu_share = 0.5 # GPU 한 장의 절반 [[jobs]] name = \"probe\" gpu_memory = \"6GiB\" # 메모리 양으로 요청 (24GiB GPU라면 0.25) ``` **배분 규칙** - 작은 작업은 이미 가장 많이 찬 GPU부터 채웁니다. 그래서 통째로 쓸 수 있는 GPU가 최대한 많이 남습니다. - GPU를 통째로 쓰는 작업은 완전히 빈 GPU만 받습니다. - 엄격한 우선순위는 그대로입니다. 중요한 작업이 GPU를 기다리는 동안에는 덜 중요한 작업이 GPU의 남은 자리에 끼어들지 않습니다. - 공용 장부로 계획하므로, 다른 에이전트가 띄운 작업들도 같은 GPU에 함께 올라갑니다. - `device = \"…"
+    "at": "2026-10-10T07:39:59Z",
+    "text": "학습 전에 RAM을 미리 잡아 두고, 큰 테이블은 그 RAM에 둬서 VRAM 대신 쓰는 기능을 만들었습니다. 커밋 `a892745`을 `nenoxcz` 이름으로 `nenoxcz/kind-maxwell-onq8cl` 브랜치에 푸시했습니다. 다만 이 환경에 GPU도 PyTorch도 없어서, 실제 GPU에서 쓰는 부분은 아직 한 번도 돌려보지 못했습니다. \"학습이 조금 걸리면\"은 학습 중에 GPU 메모리가 부족해서 걸리는(OOM) 상황으로 해석했습니다. 다른 뜻이었다면 알려 주세요. **1. 미리 잡아 두는 RAM** 작업 파일에 이렇게 적으면, Tablely가 작업을 시작하기 전에 그만큼의 RAM을 그 작업 몫으로 잡아 둡니다. ```toml [[jobs]] name = \"recsys\" command = \"python train.py\" ram = \"32GiB\" ``` - RAM은 코어처럼 배분됩니다. 모자라면 그 작업은 기다리고, 중요한 작업의 몫은 먼저 빼 둡니다. - 머신 전체에서 잡아 둘 수 있는 양은 기본으로 전체 RAM의 절반입니다. 바꾸려면 `[resources] ram`이나 `--ram`을 쓰면 됩니다. **2. 학습 스크립트 쪽: `tablely…"
   },
   "start_commit": "e18c080",
   "todos": [
@@ -120,7 +125,27 @@
     {
       "id": "18",
       "subject": "RAM tier: docs, example, handoff, commit",
+      "status": "completed"
+    },
+    {
+      "id": "19",
+      "subject": "Pipelines: after / retries / timeout in spec, planner, runner",
+      "status": "completed"
+    },
+    {
+      "id": "20",
+      "subject": "Pipelines: matrix sweeps in config, plan/status display, tests, docs, commit",
       "status": "in_progress"
+    },
+    {
+      "id": "21",
+      "subject": "Local AI gateway: tablely serve with model swapping",
+      "status": "pending"
+    },
+    {
+      "id": "22",
+      "subject": "Gateway: docs, example, handoff, commit",
+      "status": "pending"
     }
   ]
 }

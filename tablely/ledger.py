@@ -39,6 +39,7 @@ from .spec import JobSpec
 STATE_VERSION = 1
 PENDING = "pending"
 RUNNING = "running"
+BLOCKED = "blocked"  # waits for jobs it runs after; not planned yet
 
 
 def default_home() -> Path:
@@ -173,7 +174,7 @@ class Board:
             )
             if job["state"] == RUNNING:
                 running[key] = allocation_from_json(job["allocation"])
-            else:
+            elif job["state"] == PENDING:
                 pending.append(key)
         return specs, running, pending
 

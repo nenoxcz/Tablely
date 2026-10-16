@@ -52,6 +52,10 @@ def test_yaml_and_json(tmp_path):
         ({"resources": {"mps": "yes"}, "jobs": [{"name": "a", "command": "x"}]}, "mps"),
         ({"resources": {"ram": "lots"}, "jobs": [{"name": "a", "command": "x"}]}, "ram"),
         ({"jobs": [{"name": "a", "command": "x", "ram": -1}]}, "ram"),
+        ({"jobs": [{"name": "a", "command": "x", "matrix": {"lr": []}}]}, "non-empty list"),
+        ({"jobs": [{"name": "a", "command": "x", "matrix": {"gpus": [1, 2]}}]}, "plain name"),
+        ({"jobs": [{"name": "a", "command": "x", "timeout": "later"}]}, "timeout"),
+        ({"jobs": [{"name": "a", "command": "x", "after": "b c"}]}, "not a job name"),
     ],
 )
 def test_invalid_job_files_are_rejected(data, message):
@@ -98,3 +102,45 @@ def test_ram_keys():
 def test_ram_tables_example_loads():
     config = load_config(EXAMPLE.with_name("ram_tables.toml"))
     assert config.jobs[0].ram == 256 * 1024 ** 2 and config.jobs[0].device is Device.ANY
+
+
+def test_matrix_sweeps_and_pipelines():
+    config = parse_config({
+        "task": "lr sweep",
+        "jobs": [
+            {"name": "prep", "command": "prep", "device": "cpu"},
+            {"name": "train", "command": ["train.py", "--lr", "{lr}", "--amp={amp}", "--device", "{device}"],
+             "env": {"SEED": "{seed}"}, "matrix": {"lr": [1e-3, 3e-4], "seed": [0, 1], "amp": [True]},
+             "after": ["prep"], "retries": 2, "timeout": "1h30m"},
+            {"name": "eval", "command": "eval", "after": "train"},
+        ],
+    })
+    names = [j.name for j in config.jobs]
+    assert names == ["prep", "train.lr-0.001.seed-0.amp-true", "train.lr-0.001.seed-1.amp-true",
+                     "train.lr-0.0003.seed-0.amp-true", "train.lr-0.0003.seed-1.amp-true", "eval"]
+    first = config.jobs[1]
+    assert first.command == ("train.py", "--lr", "0.001", "--amp=true", "--device", "{device}")  # runtime one kept
+    assert first.env == {"SEED": "0"} and first.task == "lr sweep (lr=0.001, seed=0, amp=true)"
+    assert (first.after, first.retries, first.timeout) == (("prep",), 2, 5400.0)
+    assert config.jobs[-1].after == tuple(names[1:5])  # after the whole sweep
+
+
+def test_plan_shows_what_waits_in_a_pipeline(tmp_path, capsys):
+    from tablely.cli import main
+
+    jobfile = tmp_path / "jobs.toml"
+    jobfile.write_text("""
+[[jobs]]
+name = "prep"
+command = "x"
+device = "cpu"
+
+[[jobs]]
+name = "train"
+command = "x --seed {seed}"
+matrix = { seed = [0, 1] }
+after = ["prep"]
+""")
+    assert main(["plan", str(jobfile), "--cpus", "4", "--gpus", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "train.seed-0" in out and "train.seed-1" in out and out.count("after prep") == 2
