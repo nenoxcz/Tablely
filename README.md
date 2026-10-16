@@ -21,7 +21,8 @@ Tablely는 작업 목록을 받아서:
 8. **달성률과 재개하기 (CLI)**: `tablely status`로 작업마다 달성률(%)을 막대로 봅니다. `tablely resume`으로 이어갈 작업을 고르면, 지금까지 한 일을 요약해서 AI CLI(예: `claude`)에게 넘겨 바로 시작합니다.
 9. **AI 앱에서 참조 (MCP)**: `tablely mcp`를 연결해 두면 Claude 앱, Claude Desktop/Code, ChatGPT 앱에서 대화하다가 AI가 Tablely의 진행 상황과 재개 요약을 직접 꺼내 봅니다.
 10. **파이프라인과 스윕 (분업)**: 전처리(CPU) → 학습 여러 개(GPU) → 평가처럼 단계를 나누면, 각 단계가 맞는 장치에서 앞 단계가 끝나는 대로 시작합니다 (`after`). 하이퍼파라미터 조합은 한 줄로 펼쳐서 GPU 여러 장에 나눠 돌립니다 (`matrix`). 실패하면 다시 돌리고(`retries`), 너무 오래 걸리면 멈춥니다(`timeout`).
-11. **여러 에이전트와 핸드오프**: 같은 머신에서 여러 에이전트(AI 에이전트나 사람)가 각자 `tablely run`을 해도 GPU와 코어를 함께 계획합니다. 누가 무엇을 왜 돌리고 있는지는 자동으로 기록합니다. 그래서 다음 에이전트는 따로 인수인계 문서를 받지 않아도 `tablely brief`로 이어받을 수 있습니다.
+11. **로컬 AI 스와핑**: `tablely serve`가 OpenAI 호환 주소 하나로 로컬 모델(llama.cpp, vLLM 등) 여러 개를 서비스합니다. 요청이 오면 그 모델을 GPU에 올리고, 안 쓰면 내리고, GPU가 모자라면 모델끼리 번갈아 올립니다. 더 중요한 학습이 GPU를 기다리면 모델이 비켜 주고 CPU로 답합니다.
+12. **여러 에이전트와 핸드오프**: 같은 머신에서 여러 에이전트(AI 에이전트나 사람)가 각자 `tablely run`을 해도 GPU와 코어를 함께 계획합니다. 누가 무엇을 왜 돌리고 있는지는 자동으로 기록합니다. 그래서 다음 에이전트는 따로 인수인계 문서를 받지 않아도 `tablely brief`로 이어받을 수 있습니다.
 
 ## 설치
 
@@ -207,6 +208,7 @@ cwd = "."                 # 작업 디렉터리 (기본: 작업 파일이 있는
 shell = false             # true면 command를 셸로 실행 (파이프, && 등)
 task = "lr 1e-3, warmup 500"  # 이 작업만의 목적 (기본: 위의 task)
 switchable = false        # true면 체크포인트 후 CPU<->GPU로 옮겨질 수 있음 (아래 참고)
+cpu_command = "python train.py --device cpu"   # CPU에 배정됐을 때 command 대신 실행 (device = "any"일 때)
 after = ["prep"]          # 이 작업들이 성공한 뒤에 시작 (아래 "파이프라인과 스윕")
 retries = 1               # 실패하면 이만큼 다시 실행
 timeout = "2h"            # 이보다 오래 걸리면 멈추고 실패로 처리 ("90s", "30m", "1h30m")
@@ -469,6 +471,68 @@ ram use  ██░░░░░░░░  25% 32GiB of 128GiB reserved by 1 job
 - `tablely.stream`과의 차이: `stream`은 큰 데이터를 처음부터 끝까지 순서대로 흘려 보낼 때 씁니다. `tables`는 표의 아무 행이나 골라서 자주 읽고 쓸 때 씁니다.
 - 예시: [`examples/ram_tables.toml`](examples/ram_tables.toml), [`examples/table_train.py`](examples/table_train.py) (사용자·아이템 임베딩 학습).
 
+## 로컬 AI 스와핑: `tablely serve`
+
+로컬 LLM이나 임베딩 모델 서버(llama.cpp의 `llama-server`, vLLM 등)를 학습과 같은 머신에서 돌리면, 모델들이 GPU 메모리를 계속 붙잡고 있어서 학습이나 다른 모델이 GPU를 못 씁니다. `tablely serve`는 OpenAI 호환 주소 하나를 열고, 그 뒤의 모델 서버들을 Tablely 작업으로 돌리면서 필요할 때만 GPU에 올립니다.
+
+```toml
+# models.toml
+listen = "127.0.0.1:8800"
+idle = "5m"                 # 이만큼 안 쓰인 모델은 내림
+
+[[models]]
+name = "qwen-coder"
+aliases = ["coder"]
+command = "llama-server -m /models/qwen-coder.gguf --port {port} -ngl 99"
+cpu_command = "llama-server -m /models/qwen-coder.gguf --port {port} -ngl 0 -t {cpus}"
+gpus = 1
+cpus = 4
+priority = 3                # 이보다 중요한 학습이 GPU를 기다리면 비켜 줌
+warm = ["/models/qwen-coder.gguf"]
+
+[[models]]
+name = "embedder"
+command = "llama-server -m /models/bge-m3.gguf --port {port} --embedding -ngl 99"
+gpu_memory = "2GiB"         # 작은 모델: 다른 작은 작업과 GPU 하나를 나눠 씀
+device = "any"
+```
+
+```bash
+tablely serve models.toml
+# 어떤 OpenAI 클라이언트든 base_url만 바꾸면 됨
+curl http://127.0.0.1:8800/v1/chat/completions -H 'Content-Type: application/json' \
+     -d '{"model": "coder", "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+**스와핑 규칙**
+- **요청이 오면 올림**: 요청 본문의 `"model"`(또는 `aliases`)로 모델을 찾습니다. 그 모델이 내려가 있으면 Tablely 큐에 넣습니다. 계획에 따라 GPU(나 CPU 코어)를 받으면 서버를 띄우고, `health` 경로(기본 `/health`)가 200을 줄 때까지 기다린 뒤 요청을 넘깁니다.
+- **안 쓰면 내림**: 마지막 요청 뒤 `idle`(기본 10분, 모델마다 따로 정할 수 있음)이 지나면 서버를 멈추고 GPU를 돌려줍니다. 처리 중이거나 기다리는 요청이 있는 모델은 내리지 않습니다.
+- **모델끼리 번갈아**: 요청받은 모델이 GPU를 기다리는데 이 게이트웨이의 다른 모델이 놀면서 GPU를 잡고 있으면, 가장 오래 안 쓴 모델부터 하나씩 내립니다.
+- **학습에 비켜 주기**: 어떤 에이전트든 모델보다 `priority`가 높은 작업이 GPU를 기다리면, 놀고 있는 모델을 내립니다. 그 작업이 GPU를 쓰는 동안 같은 모델에 요청이 오면, `cpu_command`가 있는 모델은 CPU에서 답합니다. 없는 모델은 GPU가 빌 때까지 기다리다가 `load_timeout`(기본 5분)이 지나면 503을 돌려줍니다.
+- **작은 모델은 나눠 쓰기**: `gpu_share`, `gpu_memory`를 쓰면 작은 모델 여러 개가 GPU 한 장에 같이 올라갑니다 ([배분 규칙 7](#7-gpu-나눠-쓰기-gpu_share--gpu_memory)).
+- **RAM에 미리 데워 두기**: `warm`에 적은 모델 파일은 시작할 때와 모델을 내릴 때 커널 페이지 캐시로 미리 읽어 둡니다. 그래서 다시 올릴 때 디스크가 아니라 RAM에서 읽습니다 (RAM이 넉넉할 때).
+
+**요청 보내기**
+- `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings` 등 OpenAI 형식 요청은 본문의 `"model"`로 모델을 고릅니다. 스트리밍 응답(`"stream": true`)도 오는 대로 그대로 넘깁니다.
+- `GET /v1/models`: 모델 목록과 각 모델의 상태(`idle`/`waiting`/`loading`/`ready`, 어디에 올라가 있는지)를 보여줍니다.
+- `/models/<이름>/<경로>`: 모델 서버 자체의 다른 API(예: llama.cpp의 `/tokenize`)로 그대로 보냅니다.
+- `upstream_name`: 모델 서버가 다른 모델 이름을 기대하면 요청의 `"model"`을 이 값으로 바꿔서 보냅니다 (vLLM의 `--served-model-name` 등).
+- `api_key = "..."`를 적으면 `Authorization: Bearer ...`가 맞는 요청만 받습니다. 기본 주소는 이 컴퓨터 안(`127.0.0.1`)에서만 접속됩니다.
+- 모델 서버 명령에는 `{port}`(게이트웨이가 정한 포트)와 작업의 자리표시자(`{cpus}`, `{gpus}` 등)를 쓸 수 있습니다.
+
+**다른 에이전트에게 보이는 것**
+- 모델 서버도 Tablely 작업이라 `tablely status`에 나옵니다. 올라간 모델은 `running`, 내려간 모델은 `idle`로 보입니다.
+- 올리고(`queue`, `start`, `ready`) 내린(`unload`, 이유 포함) 기록은 `tablely history`에 남습니다.
+
+```
+[04:45:39] queue  qwen-coder  requested
+[04:45:39] start  qwen-coder  prio 3  GPU 0  cores 0-3 (4)
+[04:45:43] ready  qwen-coder  loaded in 4s on GPU 0
+[04:52:10] unload qwen-coder  making room for big-train (claude-a) (ran 6m31s)
+```
+
+GPU나 모델 파일 없이 해 보려면: `tablely serve examples/models.toml`. [`examples/fake_model_server.py`](examples/fake_model_server.py)가 진짜 모델 서버 대신 답합니다.
+
 ## 여러 에이전트가 한 머신을 같이 쓸 때
 
 AI 에이전트 여러 개(또는 사람)가 같은 머신에서 각자 `tablely run`을 실행해도 됩니다. 모든 `tablely run`은 머신 공용 장부(`~/.tablely`, `TABLELY_HOME` 또는 `--home`으로 변경)에 자동으로 등록됩니다. 그래서 따로 설정하지 않아도 다음이 됩니다.
@@ -690,9 +754,10 @@ Claude Code는 이렇게 추가합니다: `claude mcp add tablely -- tablely mcp
 | `tablely/ledger.py` | 머신 공용 장부: 실행/작업 등록, 죽은 실행 정리, 이벤트 기록 |
 | `tablely/affinity.py` | 프로세스 그룹 전체 코어 고정 (Linux) |
 | `tablely/config.py` | TOML/YAML/JSON 작업 파일 로딩 |
-| `tablely/cli.py` | `tablely resources / plan / run / status / history / brief / resume / mcp / note` |
+| `tablely/cli.py` | `tablely resources / plan / run / status / history / brief / resume / serve / mcp / note` |
 | `tablely/client.py` | 학습 스크립트용 선택적 헬퍼 (`device`, `progress`, `note`, `limit_gpu_memory`, `switch_requested`, `exit_for_switch` ...) |
 | `tablely/stream.py` | 큰 데이터 순차 업로드: 메모리 맵 → 고정 RAM 버퍼 → GPU, CPU는 L3 크기 블록 |
+| `tablely/gateway.py` | `tablely serve`: 로컬 모델 서버 앞의 OpenAI 호환 게이트웨이, 요청에 따라 모델을 GPU에 올리고 내림 |
 | `tablely/tables.py` | 큰 표를 미리 잡아 둔 RAM에 두고 GPU에서 쓰기, 메모리 부족 시 GPU → RAM 자동 이동 |
 | `tablely/progress.py` | 실행·에이전트 달성률 계산, 재개 요약(`resume_prompt`, `session_prompt`), AI CLI 실행 |
 | `tablely/board_view.py` | `tablely status`(달성률 막대) / `history` / `brief` 출력 |
@@ -734,7 +799,7 @@ Claude Code 같은 코딩 에이전트 여러 개가 이 저장소를 동시에 
 
 - **데몬 + `tablely submit`**: 이미 돌고 있는 실행에 작업을 추가하거나 취소. 지금은 새 작업 목록마다 `tablely run`을 하나 더 띄워야 합니다.
 - **선점(preemption) 확대**: 지금은 `switchable` 작업만 체크포인트 후 CPU로 옮기는 방식으로 GPU를 내줍니다. GPU 전용 작업을 멈췄다가 나중에 재개하는 일반 선점은 아직 없습니다.
-- **실제 GPU 서버 검증**: `tablely.stream`의 CUDA 경로(고정 메모리, 비동기 복사, 다중 GPU `map_chunks`)는 GPU가 없는 환경에서 만들었습니다. 파이프라인 로직은 대역(가짜 backend)으로 테스트했지만 실제 GPU에서는 아직 돌려보지 않았습니다. GPU 나눠 쓰기의 MPS 변수, MIG 감지, `limit_gpu_memory`도 실제 하드웨어에서는 아직 확인하지 않았습니다. `tablely.tables`의 PyTorch 경로(고정 메모리, 행 단위 비동기 전송, CUDA 메모리 부족 처리)도 가짜 GPU로만 테스트했습니다.
+- **실제 GPU 서버 검증**: `tablely.stream`의 CUDA 경로(고정 메모리, 비동기 복사, 다중 GPU `map_chunks`)는 GPU가 없는 환경에서 만들었습니다. 파이프라인 로직은 대역(가짜 backend)으로 테스트했지만 실제 GPU에서는 아직 돌려보지 않았습니다. GPU 나눠 쓰기의 MPS 변수, MIG 감지, `limit_gpu_memory`도 실제 하드웨어에서는 아직 확인하지 않았습니다. `tablely.tables`의 PyTorch 경로(고정 메모리, 행 단위 비동기 전송, CUDA 메모리 부족 처리)도 가짜 GPU로만 테스트했습니다. `tablely serve`도 가짜 모델 서버로만 확인했고, 실제 llama.cpp·vLLM 서버로는 아직 돌려보지 않았습니다.
 - **사용량 기반 나눠 쓰기**: 지금은 요청한 몫(`gpu_share`/`gpu_memory`)만 보고 배치합니다. 실제 GPU 메모리 사용량(nvidia-smi)을 보고 더 채우거나 막는 기능은 아직 없습니다.
 - **토폴로지 인지**: GPU와 같은 NUMA 노드의 코어를 우선 배정.
 - **사용률 기반 조정**: 실제 GPU/CPU 사용률을 보고 코어를 재분배. 예를 들어 GPU 사용률이 낮으면 데이터 로딩 코어를 늘립니다.

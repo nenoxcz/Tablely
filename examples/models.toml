@@ -1,0 +1,33 @@
+# Local AI models behind one OpenAI-compatible endpoint (see README: "로컬 AI 스와핑").
+#   tablely serve examples/models.toml
+#   curl http://127.0.0.1:8800/v1/chat/completions -H 'Content-Type: application/json' \
+#        -d '{"model": "coder", "messages": [{"role": "user", "content": "hi"}]}'
+#
+# fake_model_server.py stands in for a real server so this runs anywhere. With
+# llama.cpp a model would look like:
+#   command     = "llama-server -m /models/qwen2.5-coder-7b.gguf --port {port} -ngl 99"
+#   cpu_command = "llama-server -m /models/qwen2.5-coder-7b.gguf --port {port} -ngl 0 -t {cpus}"
+#   warm        = ["/models/qwen2.5-coder-7b.gguf"]
+
+listen = "127.0.0.1:8800"
+idle = "5m"              # unload a model nobody used for this long
+load_timeout = "5m"      # how long a request may wait for its model
+task = "local AI models"
+# api_key = "change-me"  # then clients must send Authorization: Bearer change-me
+
+[[models]]
+name = "qwen-coder"
+aliases = ["coder"]
+command = "python3 fake_model_server.py --name qwen-coder --port {port} --load 2"
+cpu_command = "python3 fake_model_server.py --name qwen-coder-cpu --port {port} --load 4"
+gpus = 1
+cpus = 4
+priority = 3             # training jobs with a higher priority take the GPU back
+
+[[models]]
+name = "embedder"
+command = "python3 fake_model_server.py --name embedder --port {port} --load 1"
+gpu_memory = "2GiB"      # small: shares a GPU with other small jobs
+device = "any"           # no GPU free (or none at all): the same command runs on CPU
+cpus = 1
+idle = "1m"

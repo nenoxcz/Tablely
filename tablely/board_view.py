@@ -90,7 +90,8 @@ def render_status(
     return "\n".join(lines)
 
 
-STATE_COLORS = {"ok": "green", "failed": "red", "cancelled": "dim", "running": "blue", "waiting": "dim"}
+STATE_COLORS = {"ok": "green", "failed": "red", "cancelled": "dim", "running": "blue", "waiting": "dim",
+                "idle": "dim"}
 
 
 def _bar(fraction: Optional[float], cells: int, run: Any, color: bool) -> str:
@@ -100,7 +101,7 @@ def _bar(fraction: Optional[float], cells: int, run: Any, color: bool) -> str:
 
 def _counts(run: Any, color: bool) -> str:
     parts = []
-    for state in ("ok", "failed", "running", "waiting", "cancelled"):
+    for state in ("ok", "failed", "running", "waiting", "idle", "cancelled"):
         n = run.count(state)
         if n:
             parts.append(_fmt.paint(f"{n} {state}", STATE_COLORS[state], color))

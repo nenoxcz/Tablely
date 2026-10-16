@@ -65,6 +65,7 @@ class JobSpec:
     after: Sequence[str] = ()  # jobs of the same run that must succeed before this one starts
     retries: int = 0  # run again up to this many times after a failure
     timeout: Optional[Union[float, str]] = None  # stop after this long ("2h", "30m", seconds): a failure
+    cpu_command: Optional[Union[str, Sequence[str]]] = None  # used instead of command when placed on CPU
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not _NAME_RE.match(self.name):
@@ -89,6 +90,15 @@ class JobSpec:
                 raise ValueError(f"{self.name}: shell = true needs the command as a single string")
             object.__setattr__(self, "command", command)
 
+        if self.cpu_command is not None:
+            if isinstance(self.cpu_command, str):
+                if not self.cpu_command.strip():
+                    raise ValueError(f"{self.name}: cpu_command is empty")
+            else:
+                cpu_command = tuple(self.cpu_command)
+                if not cpu_command or not all(isinstance(part, str) for part in cpu_command):
+                    raise ValueError(f"{self.name}: cpu_command must be a string or a list of strings")
+                object.__setattr__(self, "cpu_command", cpu_command)
         if not _is_number(self.priority) or not self.priority > 0 or math.isinf(self.priority):
             raise ValueError(f"{self.name}: priority must be a positive number (got {self.priority!r})")
         for attr in ("gpus", "cpus"):

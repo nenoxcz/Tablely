@@ -27,5 +27,7 @@
 - 여러 에이전트 조율은 `tablely/ledger.py`(공용 장부)와 `tablely/runner.py`의 `_tick`이 담당합니다. CPU↔GPU 전환 요청은 `runner.py`의 `_switch_wishes`가 정합니다.
 - GPU 나눠 쓰기: 몫은 `Allocation.gpu_share`(그 GPU에 대한 비율, 통째면 None)로 장부에 남고, 어느 GPU에 올릴지는 `planner.fit_gpus`(best fit)가 정합니다. 프레임워크별 제한 환경변수는 `runner.sharing_env`, MIG/메모리 감지는 `resources.detect_gpu_devices`입니다. MPS 변수와 MIG 감지, `client.limit_gpu_memory`는 실제 GPU에서 아직 확인하지 않았습니다.
 - `tablely/tables.py`(RAM을 VRAM 대신 쓰기): 표 배치와 GPU→RAM 이동(`Store`)은 backend와 분리돼 있고, `tests/test_tables.py`의 `FakeGpu`(용량을 넘으면 OOM)로 검증합니다. `TorchBackend`는 이 환경에 PyTorch가 없어 실제로 돌려보지 않았습니다. RAM 예약(`ram`)은 planner가 코어처럼 배분합니다.
+- 파이프라인: `after`가 있는 작업은 runner에서 `BLOCKED`(장부에는 `blocked`)로 기다리고 계획에 들어가지 않습니다. 앞 작업이 실패하면 `_unblock`이 건너뜁니다. `matrix` 스윕은 `config.py`의 `_expand_matrix`가 작업 파일을 읽을 때 펼칩니다.
+- 로컬 AI 게이트웨이(`tablely/gateway.py`, `tablely serve`): 모델 서버는 `Runner(on_demand=True)`의 작업입니다. 다른 스레드는 `request()`/`unload()`로 바람만 남기고, 실제 장부 변경은 다음 `_tick`에서 합니다(장부 잠금은 `_tick` 안에서만). 모델 내리기 규칙은 `Gateway._make_room`(runner의 `after_tick` 훅)과 `_monitor`(idle)에 있습니다. 테스트는 `examples/fake_model_server.py`로 합니다.
 - `tablely/stream.py`(순차 업로드)의 CUDA 경로(`CudaBackend`, 다중 GPU `map_chunks`)는 GPU 없는 환경에서는 실행되지 않습니다. 파이프라인 로직은 `tests/test_stream.py`의 가짜 backend로 검증합니다. GPU 서버에서 작업하게 되면 이 경로부터 실제로 돌려 보세요.
 - 테스트는 `tests/conftest.py`가 `TABLELY_HOME`을 임시 디렉터리로 바꾸므로 실제 `~/.tablely`를 건드리지 않습니다.

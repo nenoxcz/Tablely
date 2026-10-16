@@ -69,7 +69,7 @@ class RunView:
     def to_json(self) -> Dict[str, Any]:
         data = asdict(self)
         data.update(live=self.live, achievement=self.achievement,
-                    counts={s: self.count(s) for s in ("ok", "failed", "cancelled", "running", "waiting")})
+                    counts={s: self.count(s) for s in ("ok", "failed", "cancelled", "running", "waiting", "idle")})
         return data
 
 
@@ -115,6 +115,10 @@ def collect_runs(data: Mapping[str, Any], events: Sequence[Mapping[str, Any]]) -
                 j.state, j.switches, j.detail = "waiting", j.switches + 1, e.get("detail")
             elif kind == "retry":
                 j.state, j.detail = "waiting", e.get("detail")
+            elif kind == "unload":  # an on-demand job (e.g. a model server) stopped until needed again
+                j.state, j.detail = "idle", e.get("detail")
+            elif kind == "queue":
+                j.state, j.detail = "waiting", None
             elif kind == "wait":
                 if j.state == "waiting":
                     j.detail = e.get("detail")
@@ -146,6 +150,12 @@ def collect_runs(data: Mapping[str, Any], events: Sequence[Mapping[str, Any]]) -
             for j in view.jobs:
                 if j.state in ("waiting", "running"):  # the run ended before this job finished
                     j.state = "cancelled"
+        else:
+            for j in view.jobs:
+                if j.state == "waiting" and not any(
+                    entry["run"] == view.run and entry["name"] == j.name for entry in data.get("jobs", {}).values()
+                ):
+                    j.state = "idle"  # an on-demand job nobody asked for yet
     return sorted(runs.values(), key=lambda r: (not r.live, -(r.started or 0)))
 
 

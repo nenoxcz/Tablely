@@ -134,6 +134,16 @@ def _parser() -> argparse.ArgumentParser:
                    help="repository whose coding sessions to include (default: the current directory if it is one)")
     p.set_defaults(func=_cmd_mcp)
 
+    p = sub.add_parser(
+        "serve",
+        parents=[shared],
+        help="one OpenAI-compatible endpoint for local AI models, swapped in and out of GPUs by priority",
+    )
+    p.add_argument("config", help="gateway file listing the models (TOML, YAML or JSON)")
+    p.add_argument("--listen", help="HOST:PORT to answer on (default: from the file, else 127.0.0.1:8800)")
+    p.add_argument("--agent", help="who runs the gateway (default: $TABLELY_AGENT or the login name)")
+    p.set_defaults(func=_cmd_serve)
+
     p = sub.add_parser("note", parents=[shared], help="record what an agent is working on or what comes next")
     p.add_argument("text", nargs="+")
     p.add_argument("--agent", help="who (default: $TABLELY_AGENT or the login name)")
@@ -384,6 +394,32 @@ def _cmd_mcp(args: argparse.Namespace) -> int:
         pass
     finally:
         httpd.server_close()
+    return 0
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from .gateway import Gateway, load_gateway_config, parse_listen
+
+    config = load_gateway_config(args.config)
+    if args.listen:
+        config.host, config.port = parse_listen(args.listen)
+    try:
+        gateway = Gateway(config, ledger=Ledger(args.home), agent=args.agent)
+        url = gateway.start()
+    except (ValueError, OSError) as exc:
+        raise ConfigError(str(exc)) from None
+    names = ", ".join(m.name + (f" ({', '.join(m.aliases)})" if m.aliases else "") for m in config.models)
+    print(f"Tablely gateway: {url}/v1  (OpenAI-compatible; models: {names})", flush=True)
+    if config.api_key:
+        print("clients must send the api_key from the gateway file as a Bearer token", flush=True)
+    signal.signal(signal.SIGTERM, _raise_interrupt)
+    try:
+        while True:
+            time.sleep(3600)
+    except KeyboardInterrupt:
+        print("stopping: unloading every model", flush=True)
+    finally:
+        gateway.stop()
     return 0
 
 

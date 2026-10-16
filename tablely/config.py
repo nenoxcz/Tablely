@@ -24,7 +24,7 @@ _RESOURCE_KEYS = {"cpus", "gpus", "reserve_cpus", "gpu_memory", "mps", "ram"}
 _JOB_KEYS = {
     "name", "command", "priority", "device", "gpus", "max_gpus", "cpus", "max_cpus",
     "env", "cwd", "shell", "task", "switchable", "gpu_share", "gpu_memory", "ram",
-    "after", "retries", "timeout", "matrix",
+    "after", "retries", "timeout", "matrix", "cpu_command",
 }
 _RUNTIME_PLACEHOLDERS = {"name", "device", "gpus", "num_gpus", "cpus", "cpu_list"}
 _KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -59,6 +59,12 @@ class Config:
 
 def load_config(path: Union[str, Path]) -> Config:
     path = Path(path)
+    return parse_config(read_file(path), base_dir=path.parent)
+
+
+def read_file(path: Union[str, Path]) -> Any:
+    """The data in a TOML, YAML or JSON file."""
+    path = Path(path)
     try:
         text = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -81,7 +87,7 @@ def load_config(path: Union[str, Path]) -> Config:
         raise
     except Exception as exc:  # parser errors differ per format
         raise ConfigError(f"{path}: {exc}") from None
-    return parse_config(data, base_dir=path.parent)
+    return data
 
 
 def parse_config(data: Any, base_dir: Union[str, Path] = ".") -> Config:
@@ -184,8 +190,10 @@ def _expand_matrix(raw: Any, index: int, run_task: Optional[str]) -> List[Dict[s
 
         job = dict(raw)
         job["name"] = ".".join([str(raw.get("name"))] + [f"{k}-{_slug(values[k])}" for k in keys])
-        command = raw.get("command")
-        job["command"] = [fill(part) for part in command] if isinstance(command, list) else fill(command)
+        for key in ("command", "cpu_command"):
+            if key in raw:
+                value = raw[key]
+                job[key] = [fill(part) for part in value] if isinstance(value, list) else fill(value)
         if isinstance(raw.get("env"), Mapping):
             job["env"] = {k: fill(v) for k, v in raw["env"].items()}
         if "cwd" in raw:

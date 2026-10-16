@@ -14,10 +14,11 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple, Union
 
 from . import _fmt, affinity
 from .ledger import (
@@ -51,6 +52,7 @@ SWITCH_EXIT = 75  # EX_TEMPFAIL: "checkpointed, restart me" (see client.exit_for
 
 
 class JobState(str, enum.Enum):
+    IDLE = "idle"  # not wanted right now (a service's job before it is requested, or after unloading)
     BLOCKED = "blocked"  # waits for the jobs it runs after
     PENDING = "pending"
     RUNNING = "running"
@@ -75,7 +77,9 @@ class JobRecord:
     switch_requested: Optional[str] = None  # "gpu"/"cpu" asked of the running process
     force_cpu: bool = False  # the job asked to stay on CPU (e.g. after running out of GPU memory)
     retried: int = 0  # reruns after failures so far
-    stop_sent_at: Optional[float] = None  # when it was told to stop for running past its timeout
+    stop_sent_at: Optional[float] = None  # when it was told to stop (timeout or unload)
+    stop_reason: Optional[str] = None  # "timeout" or "unload: <why>"
+    wanted: Optional[bool] = None  # a service asked to queue (True) or unload (False) it; applied next tick
 
 
 def job_values(spec: JobSpec, alloc: Allocation) -> Dict[str, str]:
@@ -91,16 +95,20 @@ def job_values(spec: JobSpec, alloc: Allocation) -> Dict[str, str]:
 
 
 def render_command(spec: JobSpec, alloc: Allocation) -> Union[str, List[str]]:
-    """Fill ``{device}``, ``{gpus}``, ``{num_gpus}``, ``{cpus}``, ``{cpu_list}``, ``{name}``."""
+    """Fill ``{device}``, ``{gpus}``, ``{num_gpus}``, ``{cpus}``, ``{cpu_list}``, ``{name}``.
+
+    A job placed on CPU runs its ``cpu_command`` when it has one.
+    """
     values = job_values(spec, alloc)
+    template = spec.cpu_command if spec.cpu_command is not None and not alloc.on_gpu else spec.command
 
     def fill(text: str) -> str:
         return _PLACEHOLDER.sub(lambda m: values[m.group(1)], text)
 
-    if isinstance(spec.command, str):
-        command = fill(spec.command)
+    if isinstance(template, str):
+        command = fill(template)
         return command if spec.shell else shlex.split(command)
-    return [fill(part) for part in spec.command]
+    return [fill(part) for part in template]
 
 
 SHARE_ENV_VARS = ("TABLELY_GPU_SHARE", "TABLELY_GPU_MEMORY", "TABLELY_RAM")
@@ -229,6 +237,7 @@ class Runner:
         agent: Optional[str] = None,
         task: Optional[str] = None,
         mps: bool = False,
+        on_demand: bool = False,
     ) -> None:
         errors, self.warnings = check_feasible(inventory, jobs)
         if errors:
@@ -248,9 +257,15 @@ class Runner:
         self.mps = mps  # an MPS daemon runs: also set CUDA_MPS_* limits for shared GPUs
         self.run_id = secrets.token_hex(4)
         self.specs: Dict[str, JobSpec] = {spec.name: spec for spec in jobs}
+        # on_demand: nothing is queued until request() asks for it (services such as the AI gateway)
+        first = JobState.IDLE if on_demand else None
         self.records: Dict[str, JobRecord] = {
-            spec.name: JobRecord(spec, state=JobState.BLOCKED if spec.after else JobState.PENDING) for spec in jobs
+            spec.name: JobRecord(spec, state=first or (JobState.BLOCKED if spec.after else JobState.PENDING))
+            for spec in jobs
         }
+        self._mutex = threading.RLock()  # _tick vs. request()/unload() from other threads
+        self.after_tick: Optional[Callable[[Board, Plan], None]] = None  # a service's hook, under the lock
+        self.last_plan: Optional[Plan] = None
         self._keys = {name: f"{self.run_id}.{name}" for name in self.specs}
         self._names = {key: name for name, key in self._keys.items()}
         self._run_info: Dict[str, Any] = {}
@@ -345,8 +360,9 @@ class Runner:
                 "jobs": list(self.specs),
             }
             board.add_run(self.run_id, dict(self._run_info))
-            for name in self.specs:
-                self._put(board, name, self._new_entry(name, board.next_seq(), now))
+            for name, rec in self.records.items():
+                if rec.state is not JobState.IDLE:
+                    self._put(board, name, self._new_entry(name, board.next_seq(), now))
             self._outbox.append(
                 make_event(now, "run-start", self.agent, self.run_id, None, self.task,
                            f"{len(self.specs)} job(s): {', '.join(self.specs)}", jobs=list(self.specs),
@@ -433,19 +449,83 @@ class Runner:
     # -- scheduling -----------------------------------------------------------
 
     def _tick(self) -> None:
-        with self.ledger.locked() as board:
+        with self._mutex, self.ledger.locked() as board:
             board.prune()
             self._sync(board)
+            self._apply_wishes(board)
             self._enforce_timeouts()
             self._reap(board)
             self._unblock(board)
             self._schedule(board)
+            if self.after_tick is not None and self.last_plan is not None:
+                self.after_tick(board, self.last_plan)
             self._flush(board)
+
+    # -- on-demand jobs (services) ----------------------------------------------
+
+    def serve(self, stop: threading.Event, registered: bool = False) -> None:
+        """Keep scheduling until ``stop`` is set, for jobs queued and unloaded on demand."""
+        if not registered:
+            self._register()
+        try:
+            while not stop.is_set():
+                self._tick()
+                stop.wait(self.poll_interval)
+        finally:
+            with self._mutex:
+                self._stop_all()
+                self._unregister()
+
+    def request(self, name: str) -> None:
+        """Queue job ``name`` again if it is not queued or running (applied on the next tick)."""
+        with self._mutex:
+            rec = self.records[name]
+            if rec.state not in (JobState.PENDING, JobState.RUNNING, JobState.BLOCKED) or rec.wanted is False:
+                rec.wanted = True
+
+    def unload(self, name: str, reason: str) -> None:
+        """Stop job ``name`` and leave it idle until requested again (not a failure).
+
+        A running job gets SIGTERM now (SIGKILL after ``stop_timeout``); the
+        board is updated on the next tick.
+        """
+        with self._mutex:
+            rec = self.records[name]
+            if rec.state is JobState.RUNNING and rec.stop_sent_at is None:
+                rec.stop_sent_at, rec.stop_reason = time.time(), f"unload: {reason}"
+                self._signal_group(rec, signal.SIGTERM)
+                rec.wanted = None
+            elif rec.state is JobState.PENDING:
+                rec.wanted = False
+                rec.stop_reason = f"unload: {reason}"
+
+    def note(self, name: str, kind: str, detail: str) -> None:
+        """Record an event about job ``name`` from another thread (written on the next tick)."""
+        with self._mutex:
+            self._event(kind, self.records[name], detail)
+
+    def _apply_wishes(self, board: Board) -> None:
+        now = time.time()
+        for name, rec in self.records.items():
+            wanted, rec.wanted = rec.wanted, None
+            if wanted is True and rec.state not in (JobState.PENDING, JobState.RUNNING, JobState.BLOCKED):
+                rec.state = JobState.PENDING
+                rec.process = rec.allocation = rec.error = rec.returncode = None
+                rec.started_at = rec.ended_at = rec.stop_sent_at = rec.stop_reason = None
+                rec.retried, rec.wait_reason, rec.switch_requested = 0, None, None
+                self._put(board, name, self._new_entry(name, board.next_seq(), now))
+                self._event("queue", rec, "requested")
+            elif wanted is False and rec.state is JobState.PENDING:
+                rec.state = JobState.IDLE
+                board.drop_job(self._keys[name])
+                self._event("unload", rec, rec.stop_reason or "no longer wanted")
+                rec.stop_reason = None
 
     def _schedule(self, board: Board) -> None:
         while True:
             specs, running, pending = board.planning_view()
             decision = plan(self.inventory, specs, running, pending, self.policy)
+            self.last_plan = decision
 
             for key, alloc in decision.allocations.items():
                 entry = board.job(key)
@@ -603,7 +683,7 @@ class Runner:
         rec.state = JobState.RUNNING
         rec.allocation = alloc
         rec.started_at = time.time()
-        rec.stop_sent_at = None
+        rec.stop_sent_at = rec.stop_reason = None
         rec.wait_reason = None
         rec.switch_requested = None
         entry = board.job(key)
@@ -646,7 +726,10 @@ class Runner:
                     self._requeue(rec, board)
                     continue
                 rec.error = f"asked to switch devices more than {self.max_switches} times"
-            if rec.stop_sent_at is not None:
+            if rec.stop_reason and rec.stop_reason.startswith("unload"):
+                self._unloaded(rec, board, code)
+                continue
+            if rec.stop_reason == "timeout":
                 code = code or 1
                 rec.error = f"timed out after {_fmt.duration(rec.spec.timeout)}"
             if code != 0 and rec.retried < rec.spec.retries:
@@ -662,6 +745,19 @@ class Runner:
             else:
                 why = rec.error or f"exit {code} after {took}"
                 self._event("fail", rec, f"{why}, see {rec.log_path}", **outcome)
+
+    def _unloaded(self, rec: JobRecord, board: Board, code: int) -> None:
+        """A job stopped by ``unload`` goes idle: its resources are free, nothing failed."""
+        name = rec.spec.name
+        why = rec.stop_reason.split(": ", 1)[-1]
+        took = _fmt.duration(rec.ended_at - rec.started_at)
+        self._shadow[name] = board.job(self._keys[name]) or self._shadow[name]
+        board.drop_job(self._keys[name])
+        rec.state = JobState.IDLE
+        rec.process = None
+        rec.stop_sent_at = rec.stop_reason = None
+        self._event("unload", rec, f"{why} (ran {took})", returncode=code)
+        rec.allocation = None
 
     def _retry(self, rec: JobRecord, board: Board, code: int) -> None:
         """A failed job with retries left goes back to the queue."""
@@ -715,10 +811,8 @@ class Runner:
         """Stop jobs running past their ``timeout``: SIGTERM, then SIGKILL after ``stop_timeout``."""
         now = time.time()
         for rec in self._in_state(JobState.RUNNING):
-            if rec.spec.timeout is None:
-                continue
-            if rec.stop_sent_at is None and now - rec.started_at >= rec.spec.timeout:
-                rec.stop_sent_at = now
+            if rec.stop_sent_at is None and rec.spec.timeout is not None and now - rec.started_at >= rec.spec.timeout:
+                rec.stop_sent_at, rec.stop_reason = now, "timeout"
                 self._signal_group(rec, signal.SIGTERM)
                 self._event("timeout", rec, f"ran longer than {_fmt.duration(rec.spec.timeout)}; stopping it")
             elif rec.stop_sent_at is not None and now - rec.stop_sent_at >= self.stop_timeout:

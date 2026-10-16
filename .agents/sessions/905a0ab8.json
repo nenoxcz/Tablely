@@ -6,7 +6,7 @@
   "task": "Pipelines (after/retries/timeout/matrix sweeps) and a local AI gateway that swaps model servers in and out of GPUs",
   "task_source": "agent",
   "started_at": "2026-10-08T05:38:03Z",
-  "updated_at": "2026-10-16T04:38:41Z",
+  "updated_at": "2026-10-16T04:54:30Z",
   "prompts": [
     {
       "at": "2026-10-08T07:05:34Z",
@@ -49,12 +49,15 @@
     "tablely/mcp.py",
     "tablely/tables.py",
     "tests/test_tables.py",
-    "tests/test_pipeline.py"
+    "tests/test_pipeline.py",
+    "examples/fake_model_server.py",
+    "tablely/gateway.py",
+    "tests/test_gateway.py"
   ],
   "handoff": {
-    "at": "2026-10-16T04:38:41Z",
-    "text": "Done (pipelines): after = [...] (job waits as state 'blocked', not planned, skipped if a dependency fails), retries (TABLELY_ATTEMPT), timeout (SIGTERM then SIGKILL, counts as failure), matrix sweeps expanded in config.py (names train.lr-0.001.seed-0, {key} filled in command/env/cwd/task, after = [group] waits for every variant). Next in this session: local AI gateway (tablely serve) that swaps model servers in and out of GPUs.",
-    "head": "a892745"
+    "at": "2026-10-16T04:54:30Z",
+    "text": "Done: (1) pipelines - after/retries/timeout/matrix (commit 731e519). (2) Local AI gateway 'tablely serve models.toml': OpenAI-compatible proxy; each model server is a Runner(on_demand=True) job; request() queues it, health check marks it ready, idle -> unload, Gateway._make_room (runner.after_tick hook) unloads the LRU idle model when one of ours or a higher-priority job of any agent waits for GPU/RAM; cpu_command lets a model answer from CPU while training holds the GPU; warm = files read ahead into page cache; streamed responses relayed. Tested with examples/fake_model_server.py only. Next: try real llama-server/vLLM on a GPU box (health path, load times, SIGTERM behaviour); maybe expose gateway status through MCP; daemon/submit still open. Caveat: board changes from other threads go through request()/unload() flags applied in _tick - never take the ledger lock inside after_tick.",
+    "head": "731e519"
   },
   "last_reply": {
     "at": "2026-10-10T07:39:59Z",
@@ -135,17 +138,17 @@
     {
       "id": "20",
       "subject": "Pipelines: matrix sweeps in config, plan/status display, tests, docs, commit",
-      "status": "in_progress"
+      "status": "completed"
     },
     {
       "id": "21",
       "subject": "Local AI gateway: tablely serve with model swapping",
-      "status": "pending"
+      "status": "completed"
     },
     {
       "id": "22",
       "subject": "Gateway: docs, example, handoff, commit",
-      "status": "pending"
+      "status": "in_progress"
     }
   ]
 }
